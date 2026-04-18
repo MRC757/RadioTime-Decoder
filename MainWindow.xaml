@@ -1,0 +1,599 @@
+<Window x:Class="WwvDecoder.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:WwvDecoder"
+        Title="HF Time Signal Decoder"
+        Height="830" Width="540"
+        MinHeight="700" MinWidth="480"
+        ResizeMode="CanResize"
+        Background="#1E1E2E"
+        FontFamily="Segoe UI">
+
+    <Window.Resources>
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+            <Setter Property="FontFamily" Value="Segoe UI"/>
+        </Style>
+
+        <Style x:Key="LabelStyle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#A6ADC8"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+
+        <Style x:Key="SectionHeader" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#89B4FA"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Margin" Value="0,0,0,4"/>
+        </Style>
+
+        <Style x:Key="PanelBorder" TargetType="Border">
+            <Setter Property="Background" Value="#313244"/>
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="Padding" Value="12"/>
+        </Style>
+
+        <Style x:Key="PrimaryButton" TargetType="Button">
+            <Setter Property="Background" Value="#89B4FA"/>
+            <Setter Property="Foreground" Value="#1E1E2E"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="16,8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                CornerRadius="5"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#B4D0FF"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Background" Value="#45475A"/>
+                                <Setter Property="Foreground" Value="#6C7086"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="SecondaryButton" TargetType="Button">
+            <Setter Property="Background" Value="#A6E3A1"/>
+            <Setter Property="Foreground" Value="#1E1E2E"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="16,8"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                CornerRadius="5"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#CCF5C9"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Background" Value="#45475A"/>
+                                <Setter Property="Foreground" Value="#6C7086"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#313244"/>
+            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="BorderBrush" Value="#89B4FA"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton Focusable="False" ClickMode="Press"
+                                         IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border Background="{Binding Background, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                                                BorderBrush="{Binding BorderBrush, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                                                BorderThickness="1" CornerRadius="3">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*"/>
+                                                    <ColumnDefinition Width="24"/>
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock Grid.Column="1" Text="▾"
+                                                           Foreground="#89B4FA"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center"/>
+                                            </Grid>
+                                        </Border>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <ContentPresenter IsHitTestVisible="False"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              Margin="8,0,28,0"
+                                              VerticalAlignment="Center">
+                                <ContentPresenter.Resources>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Foreground" Value="#FFFFFF"/>
+                                        <Setter Property="FontFamily" Value="Segoe UI"/>
+                                    </Style>
+                                </ContentPresenter.Resources>
+                            </ContentPresenter>
+                            <Popup x:Name="PART_Popup"
+                                   Placement="Bottom"
+                                   IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   AllowsTransparency="True"
+                                   Focusable="False">
+                                <Border MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                                        MaxHeight="{TemplateBinding MaxDropDownHeight}"
+                                        Background="#313244"
+                                        BorderBrush="#89B4FA"
+                                        BorderThickness="1"
+                                        CornerRadius="3">
+                                    <ScrollViewer>
+                                        <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Contained"/>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="ItemContainerStyle">
+                <Setter.Value>
+                    <Style TargetType="ComboBoxItem">
+                        <Setter Property="Background" Value="#313244"/>
+                        <Setter Property="Foreground" Value="#FFFFFF"/>
+                        <Setter Property="Padding" Value="8,5"/>
+                        <Style.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#45475A"/>
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter Property="Background" Value="#89B4FA"/>
+                                <Setter Property="Foreground" Value="#1E1E2E"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="DarkTextBox" TargetType="TextBox">
+            <Setter Property="Background" Value="#313244"/>
+            <Setter Property="Foreground" Value="#FFFFFF"/>
+            <Setter Property="CaretBrush" Value="#FFFFFF"/>
+            <Setter Property="SelectionBrush" Value="#89B4FA"/>
+            <Setter Property="BorderBrush" Value="#89B4FA"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="Padding" Value="8,0"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="FontFamily" Value="Consolas"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+
+        <Style x:Key="SmallButton" TargetType="Button">
+            <Setter Property="Background" Value="#45475A"/>
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Padding" Value="10,0"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#585B70"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <local:BoolToStartStopConverter x:Key="BoolToStartStop"/>
+        <local:BoolToStartStopColorConverter x:Key="BoolToStartStopColor"/>
+        <local:LockStateToColorConverter x:Key="LockStateToColor"/>
+        <local:LockStateToTextConverter x:Key="LockStateToText"/>
+    </Window.Resources>
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- Title -->
+        <Grid Grid.Row="0" Margin="0,0,0,14">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="HF Time Signal" FontSize="20" FontWeight="Bold" Foreground="#89B4FA"/>
+                <TextBlock Text="  Decoder" FontSize="20" Foreground="#CDD6F4"/>
+            </StackPanel>
+            <Button HorizontalAlignment="Right" VerticalAlignment="Center"
+                    Content="Station Reference Table"
+                    Background="#313244"
+                    Foreground="#89B4FA"
+                    BorderBrush="#45475A" BorderThickness="1"
+                    Padding="10,4" Cursor="Hand"
+                    FontSize="11"
+                    Command="{Binding ShowStationReferenceCommand}">
+                <Button.Template>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#45475A"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Button.Template>
+            </Button>
+        </Grid>
+
+        <!-- Device + Station -->
+        <Border Grid.Row="1" Style="{StaticResource PanelBorder}" Margin="0,0,0,10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="6"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+
+                <!-- Audio device -->
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Audio Device" Style="{StaticResource LabelStyle}"/>
+                <ComboBox Grid.Row="0" Grid.Column="1"
+                          ItemsSource="{Binding AudioDevices}"
+                          SelectedItem="{Binding SelectedDevice}"
+                          DisplayMemberPath="Name"
+                          IsEnabled="{Binding IsNotListening}"/>
+
+                <!-- Station selector -->
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="Station" Style="{StaticResource LabelStyle}"/>
+                <ComboBox Grid.Row="2" Grid.Column="1"
+                          ItemsSource="{Binding AllStations}"
+                          SelectedItem="{Binding SelectedStation}"
+                          DisplayMemberPath="DisplayName"
+                          IsEnabled="{Binding IsNotListening}"/>
+
+                <!-- Decoder support badge + frequencies -->
+                <TextBlock Grid.Row="4" Grid.Column="0" Text="Frequencies" Style="{StaticResource LabelStyle}"/>
+                <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding SelectedStation.FrequencyList}"
+                               FontFamily="Consolas" FontSize="11"
+                               Foreground="#CDD6F4" VerticalAlignment="Center"
+                               Margin="0,0,10,0"/>
+                    <Border CornerRadius="3" Padding="6,2" VerticalAlignment="Center"
+                            Background="{Binding DecoderSupportBackground}">
+                        <TextBlock Text="{Binding DecoderSupportLabel}"
+                                   FontSize="10" FontWeight="SemiBold"
+                                   Foreground="{Binding DecoderSupportForeground}"/>
+                    </Border>
+                </StackPanel>
+
+                <!-- UTC offset selector for local time display -->
+                <TextBlock Grid.Row="6" Grid.Column="0" Text="UTC Offset" Style="{StaticResource LabelStyle}"/>
+                <ComboBox Grid.Row="6" Grid.Column="1"
+                          ItemsSource="{Binding UtcOffsetOptions}"
+                          SelectedItem="{Binding SelectedUtcOffsetLabel}"/>
+
+                <!-- Operator UTC date hint — pre-fills DOY and year bits in the decoder -->
+                <TextBlock Grid.Row="8" Grid.Column="0" Text="UTC Date" Style="{StaticResource LabelStyle}"/>
+                <Grid Grid.Row="8" Grid.Column="1">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="6"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="6"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox Grid.Column="0"
+                             Text="{Binding KnownDateText, UpdateSourceTrigger=PropertyChanged}"
+                             Style="{StaticResource DarkTextBox}"
+                             ToolTip="Today's date in UTC (yyyy-MM-dd). Pre-fills day-of-year and year bits to help decoding under poor signal."/>
+                    <Button Grid.Column="2" Content="Apply"
+                            Style="{StaticResource SmallButton}"
+                            Foreground="#A6E3A1"
+                            Command="{Binding ApplyKnownDateCommand}"
+                            ToolTip="Write today's UTC date into the decoder's persistent bit store"/>
+                    <Button Grid.Column="4" Content="Clear"
+                            Style="{StaticResource SmallButton}"
+                            Command="{Binding ClearKnownDateCommand}"
+                            ToolTip="Remove the operator date hint — bits revert to unknown until next successful decode"/>
+                </Grid>
+            </Grid>
+        </Border>
+
+        <!-- Signal meters -->
+        <Border Grid.Row="2" Style="{StaticResource PanelBorder}" Margin="0,0,0,10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="110"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="70"/>
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Signal Level" Style="{StaticResource LabelStyle}"/>
+                <ProgressBar Grid.Row="0" Grid.Column="1"
+                             Value="{Binding SignalStrength, Mode=OneWay}"
+                             Minimum="0" Maximum="100"
+                             Height="14" VerticalAlignment="Center"
+                             Background="#45475A" Foreground="#89B4FA"
+                             BorderThickness="0"/>
+                <TextBlock Grid.Row="0" Grid.Column="2"
+                           Text="{Binding SignalStrengthDb}"
+                           Style="{StaticResource LabelStyle}"
+                           HorizontalAlignment="Right"/>
+
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="100 Hz Level" Style="{StaticResource LabelStyle}"/>
+                <ProgressBar Grid.Row="2" Grid.Column="1"
+                             Value="{Binding SubcarrierStrength, Mode=OneWay}"
+                             Minimum="0" Maximum="100"
+                             Height="14" VerticalAlignment="Center"
+                             Background="#45475A" Foreground="#CBA6F7"
+                             BorderThickness="0"/>
+                <TextBlock Grid.Row="2" Grid.Column="2"
+                           Text="{Binding SubcarrierStrengthDb}"
+                           Style="{StaticResource LabelStyle}"
+                           HorizontalAlignment="Right"/>
+
+                <TextBlock Grid.Row="4" Grid.Column="0" Text="100 Hz Lock" Style="{StaticResource LabelStyle}"/>
+                <ProgressBar Grid.Row="4" Grid.Column="1"
+                             Value="{Binding LockStrength, Mode=OneWay}"
+                             Minimum="0" Maximum="100"
+                             Height="14" VerticalAlignment="Center"
+                             Background="#45475A"
+                             Foreground="{Binding LockState, Converter={StaticResource LockStateToColor}}"
+                             BorderThickness="0"/>
+                <StackPanel Grid.Row="4" Grid.Column="2" Orientation="Horizontal"
+                            HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding CountdownDisplay}"
+                               Style="{StaticResource LabelStyle}"
+                               Foreground="#F9E2AF"
+                               Margin="0,0,4,0"/>
+                    <TextBlock Text="{Binding LockState, Converter={StaticResource LockStateToText}}"
+                               Style="{StaticResource LabelStyle}"
+                               Foreground="{Binding LockState, Converter={StaticResource LockStateToColor}}"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Frame visualization: 60-cell color grid, one cell per BCD bit position.
+             Colors: green=Confident, mauve=Erased, yellow=GapFilled, red=Corrected, grey=Empty.
+             Hover a cell to see its position index, value (0/1/M), and classification state. -->
+        <Border Grid.Row="3" Style="{StaticResource PanelBorder}" Margin="0,0,0,10">
+            <StackPanel>
+                <TextBlock Text="Frame Bits" Style="{StaticResource SectionHeader}"/>
+                <ItemsControl ItemsSource="{Binding FrameCells}">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <UniformGrid Rows="1" Columns="60"/>
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="{Binding Background}"
+                                    Margin="0.5" Height="18"
+                                    ToolTip="{Binding ToolTip}"
+                                    ToolTipService.InitialShowDelay="300"/>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+                <!-- Legend -->
+                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                    <Border Width="10" Height="10" Background="#A6E3A1" Margin="0,0,4,0"/>
+                    <TextBlock Text="Confident" FontSize="10" Foreground="#6C7086" Margin="0,0,12,0" VerticalAlignment="Center"/>
+                    <Border Width="10" Height="10" Background="#CBA6F7" Margin="0,0,4,0"/>
+                    <TextBlock Text="Erased" FontSize="10" Foreground="#6C7086" Margin="0,0,12,0" VerticalAlignment="Center"/>
+                    <Border Width="10" Height="10" Background="#F9E2AF" Margin="0,0,4,0"/>
+                    <TextBlock Text="Gap-filled" FontSize="10" Foreground="#6C7086" Margin="0,0,12,0" VerticalAlignment="Center"/>
+                    <Border Width="10" Height="10" Background="#F38BA8" Margin="0,0,4,0"/>
+                    <TextBlock Text="Corrected" FontSize="10" Foreground="#6C7086" VerticalAlignment="Center"/>
+                </StackPanel>
+            </StackPanel>
+        </Border>
+
+        <!-- Decoded time -->
+        <Border Grid.Row="4" Style="{StaticResource PanelBorder}" Margin="0,0,0,10">
+            <StackPanel>
+                <TextBlock Text="Decoded UTC Time" Style="{StaticResource SectionHeader}"/>
+
+                <!-- UTC time + date -->
+                <Border Background="#1E1E2E" CornerRadius="4" Padding="10,8" Margin="0,0,0,4">
+                    <StackPanel HorizontalAlignment="Center">
+                        <TextBlock Text="{Binding DecodedTimeDisplay}"
+                                   FontSize="32" FontWeight="Bold"
+                                   FontFamily="Consolas"
+                                   Foreground="#A6E3A1"
+                                   HorizontalAlignment="Center"/>
+                        <TextBlock Text="{Binding DecodedDateDisplay}"
+                                   FontSize="13" FontFamily="Consolas"
+                                   Foreground="#89DCEB"
+                                   HorizontalAlignment="Center"
+                                   Margin="0,3,0,0"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- Local time -->
+                <Border Background="#1E1E2E" CornerRadius="4" Padding="8,5" Margin="0,0,0,10">
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                        <TextBlock Text="Local  " FontSize="11" Foreground="#6C7086"
+                                   VerticalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Text="{Binding LocalTimeDisplay}"
+                                   FontSize="13" FontFamily="Consolas"
+                                   Foreground="#F9E2AF"
+                                   VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Border>
+
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="DUT1" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="{Binding Dut1Display}" FontSize="13" Foreground="#CDD6F4"/>
+
+                    <TextBlock Grid.Row="0" Grid.Column="1" Text="DST" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding DstDisplay}" FontSize="13" Foreground="#CDD6F4"/>
+
+                    <TextBlock Grid.Row="0" Grid.Column="2" Text="Leap Second" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock Grid.Row="1" Grid.Column="2" Text="{Binding LeapSecondDisplay}" FontSize="13" Foreground="#CDD6F4"/>
+                </Grid>
+
+                <Grid Margin="0,10,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="70"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Confidence" Style="{StaticResource LabelStyle}"/>
+                    <ProgressBar Grid.Column="1"
+                                 Value="{Binding ConfidencePercent, Mode=OneWay}"
+                                 Minimum="0" Maximum="100"
+                                 Height="14" VerticalAlignment="Center"
+                                 Background="#45475A" Foreground="#F9E2AF"
+                                 BorderThickness="0"/>
+                    <TextBlock Grid.Column="2"
+                               Text="{Binding ConfidenceDisplay}"
+                               Style="{StaticResource LabelStyle}"
+                               HorizontalAlignment="Right"/>
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <!-- Buttons -->
+        <Grid Grid.Row="5" Margin="0,0,0,10">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="10"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <Button Grid.Row="0" Grid.Column="0"
+                    Content="{Binding IsListening, Converter={StaticResource BoolToStartStop}}"
+                    Background="{Binding IsListening, Converter={StaticResource BoolToStartStopColor}}"
+                    Style="{StaticResource PrimaryButton}"
+                    Command="{Binding ToggleListenCommand}"/>
+
+            <Button Grid.Row="0" Grid.Column="2"
+                    Content="Set System Clock"
+                    Style="{StaticResource SecondaryButton}"
+                    Command="{Binding SetClockCommand}"
+                    IsEnabled="{Binding CanSetClock}"/>
+
+            <TextBlock Grid.Row="1" Grid.ColumnSpan="3"
+                       Text="Set System Clock adjusts UTC — Windows automatically displays your local time based on timezone settings."
+                       FontSize="10" Foreground="#6C7086"
+                       TextAlignment="Center" TextWrapping="Wrap"
+                       Margin="0,5,0,0"/>
+        </Grid>
+
+        <!-- Log -->
+        <Border Grid.Row="6" Style="{StaticResource PanelBorder}">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Activity Log" Style="{StaticResource SectionHeader}"/>
+                <Button Grid.Row="0" Grid.Column="1"
+                        Content="Clear"
+                        Background="Transparent"
+                        Foreground="#6C7086"
+                        BorderThickness="0"
+                        FontSize="11"
+                        Cursor="Hand"
+                        Command="{Binding ClearLogCommand}"/>
+
+                <TextBox Grid.Row="1" Grid.ColumnSpan="2"
+                         Text="{Binding LogText, Mode=OneWay}"
+                         FontFamily="Consolas" FontSize="11"
+                         Foreground="#A6ADC8" TextWrapping="Wrap"
+                         IsReadOnly="True" IsReadOnlyCaretVisible="True"
+                         Background="Transparent" BorderThickness="0"
+                         Padding="0" Margin="0,4,0,0" MinHeight="80"
+                         VerticalScrollBarVisibility="Auto"
+                         HorizontalScrollBarVisibility="Disabled"
+                         x:Name="LogTextBox">
+                    <TextBox.ContextMenu>
+                        <ContextMenu Background="#313244" BorderBrush="#45475A">
+                            <MenuItem Header="Copy" Command="ApplicationCommands.Copy"
+                                      Foreground="#CDD6F4" Background="Transparent"/>
+                            <MenuItem Header="Select All" Command="ApplicationCommands.SelectAll"
+                                      Foreground="#CDD6F4" Background="Transparent"/>
+                        </ContextMenu>
+                    </TextBox.ContextMenu>
+                </TextBox>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

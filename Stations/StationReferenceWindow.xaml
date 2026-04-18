@@ -1,0 +1,287 @@
+<Window x:Class="WwvDecoder.Stations.StationReferenceWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="HF Time Signal Stations — World Reference"
+        Height="620" Width="900"
+        Background="#1E1E2E"
+        FontFamily="Segoe UI"
+        WindowStartupLocation="CenterOwner">
+
+    <Window.Resources>
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+        </Style>
+
+        <!-- DataGrid overall -->
+        <Style TargetType="DataGrid">
+            <Setter Property="Background" Value="#1E1E2E"/>
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+            <Setter Property="BorderBrush" Value="#45475A"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="RowBackground" Value="#313244"/>
+            <Setter Property="AlternatingRowBackground" Value="#2A2A3E"/>
+            <Setter Property="HorizontalGridLinesBrush" Value="#45475A"/>
+            <Setter Property="VerticalGridLinesBrush" Value="#45475A"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="ColumnHeaderHeight" Value="30"/>
+        </Style>
+
+        <!-- Column headers -->
+        <Style TargetType="DataGridColumnHeader">
+            <Setter Property="Background" Value="#181825"/>
+            <Setter Property="Foreground" Value="#89B4FA"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="8,4"/>
+            <Setter Property="BorderBrush" Value="#45475A"/>
+            <Setter Property="BorderThickness" Value="0,0,1,1"/>
+        </Style>
+
+        <!-- Row cells -->
+        <Style TargetType="DataGridCell">
+            <Setter Property="Padding" Value="6,3"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="Foreground" Value="#CDD6F4"/>
+            <Style.Triggers>
+                <Trigger Property="IsSelected" Value="True">
+                    <Setter Property="Background" Value="#45475A"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style TargetType="DataGridRow">
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Background" Value="#3D3F55"/>
+                </Trigger>
+            </Style.Triggers>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Title -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,10">
+            <TextBlock Text="HF Time Signal Stations" FontSize="18" FontWeight="Bold" Foreground="#89B4FA"/>
+            <TextBlock Text="  —  World Reference" FontSize="18" Foreground="#CDD6F4"/>
+        </StackPanel>
+
+        <!-- Legend -->
+        <WrapPanel Grid.Row="1" Margin="0,0,0,10" Orientation="Horizontal">
+            <Border Background="#A6E3A1" CornerRadius="3" Padding="6,2" Margin="0,0,8,4">
+                <TextBlock Text="Decoder Supported" FontSize="11" Foreground="#1E1E2E" FontWeight="SemiBold"/>
+            </Border>
+            <Border Background="#F9E2AF" CornerRadius="3" Padding="6,2" Margin="0,0,8,4">
+                <TextBlock Text="Future Decoder" FontSize="11" Foreground="#1E1E2E" FontWeight="SemiBold"/>
+            </Border>
+            <Border Background="#45475A" CornerRadius="3" Padding="6,2" Margin="0,0,8,4">
+                <TextBlock Text="Ticks Only / Unknown" FontSize="11" Foreground="#CDD6F4" FontWeight="SemiBold"/>
+            </Border>
+            <Border Background="#F38BA8" CornerRadius="3" Padding="6,2" Margin="0,0,8,4">
+                <TextBlock Text="Uncertain / Inactive" FontSize="11" Foreground="#1E1E2E" FontWeight="SemiBold"/>
+            </Border>
+        </WrapPanel>
+
+        <!-- Table -->
+        <DataGrid Grid.Row="2"
+                  x:Name="StationGrid"
+                  AutoGenerateColumns="False"
+                  IsReadOnly="True"
+                  SelectionMode="Single"
+                  CanUserReorderColumns="False"
+                  CanUserResizeRows="False"
+                  GridLinesVisibility="All"
+                  HeadersVisibility="Column"
+                  Margin="0,0,0,10">
+
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Call Sign" Binding="{Binding CallSign}" Width="75">
+                    <DataGridTextColumn.ElementStyle>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="FontWeight" Value="Bold"/>
+                            <Setter Property="Foreground" Value="#89B4FA"/>
+                            <Setter Property="VerticalAlignment" Value="Center"/>
+                            <Setter Property="Padding" Value="6,3"/>
+                        </Style>
+                    </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+
+                <DataGridTextColumn Header="Location" Binding="{Binding Location}" Width="160">
+                    <DataGridTextColumn.ElementStyle>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="VerticalAlignment" Value="Center"/>
+                            <Setter Property="Padding" Value="6,3"/>
+                        </Style>
+                    </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+
+                <DataGridTextColumn Header="Country" Binding="{Binding Country}" Width="90">
+                    <DataGridTextColumn.ElementStyle>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="VerticalAlignment" Value="Center"/>
+                            <Setter Property="Padding" Value="6,3"/>
+                        </Style>
+                    </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+
+                <DataGridTextColumn Header="Frequencies" Binding="{Binding FrequencyList}" Width="175">
+                    <DataGridTextColumn.ElementStyle>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="FontFamily" Value="Consolas"/>
+                            <Setter Property="FontSize" Value="11"/>
+                            <Setter Property="VerticalAlignment" Value="Center"/>
+                            <Setter Property="Padding" Value="6,3"/>
+                        </Style>
+                    </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+
+                <DataGridTextColumn Header="Agency" Binding="{Binding Agency}" Width="100">
+                    <DataGridTextColumn.ElementStyle>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="VerticalAlignment" Value="Center"/>
+                            <Setter Property="Padding" Value="6,3"/>
+                        </Style>
+                    </DataGridTextColumn.ElementStyle>
+                </DataGridTextColumn>
+
+                <DataGridTemplateColumn Header="Format / Status" Width="*">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="6,3">
+                                <Border CornerRadius="3" Padding="5,2" Margin="0,0,6,0">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsDecoderSupported}" Value="True">
+                                                    <Setter Property="Background" Value="#2D4A38"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding TimeCodeFormat}" Value="ChuFsk">
+                                                    <Setter Property="Background" Value="#4A4020"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding TimeCodeFormat}" Value="RwmPhase">
+                                                    <Setter Property="Background" Value="#4A4020"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding TimeCodeFormat}" Value="TicksOnly">
+                                                    <Setter Property="Background" Value="#313244"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <TextBlock FontSize="11" FontWeight="SemiBold">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding TimeCodeFormat}" Value="WwvBcd">
+                                                        <Setter Property="Text" Value="100 Hz BCD"/>
+                                                        <Setter Property="Foreground" Value="#A6E3A1"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding TimeCodeFormat}" Value="ChuFsk">
+                                                        <Setter Property="Text" Value="300bd FSK"/>
+                                                        <Setter Property="Foreground" Value="#F9E2AF"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding TimeCodeFormat}" Value="RwmPhase">
+                                                        <Setter Property="Text" Value="Phase Shift"/>
+                                                        <Setter Property="Foreground" Value="#F9E2AF"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding TimeCodeFormat}" Value="TicksOnly">
+                                                        <Setter Property="Text" Value="Ticks Only"/>
+                                                        <Setter Property="Foreground" Value="#A6ADC8"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Border>
+                                <Border CornerRadius="3" Padding="5,2">
+                                    <Border.Style>
+                                        <Style TargetType="Border">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding Status}" Value="Active">
+                                                    <Setter Property="Background" Value="#2D4A38"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="Uncertain">
+                                                    <Setter Property="Background" Value="#4A2020"/>
+                                                </DataTrigger>
+                                                <DataTrigger Binding="{Binding Status}" Value="Inactive">
+                                                    <Setter Property="Background" Value="#3A1818"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Border.Style>
+                                    <TextBlock FontSize="11">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding Status}" Value="Active">
+                                                        <Setter Property="Text" Value="Active"/>
+                                                        <Setter Property="Foreground" Value="#A6E3A1"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Status}" Value="Uncertain">
+                                                        <Setter Property="Text" Value="Uncertain"/>
+                                                        <Setter Property="Foreground" Value="#F38BA8"/>
+                                                    </DataTrigger>
+                                                    <DataTrigger Binding="{Binding Status}" Value="Inactive">
+                                                        <Setter Property="Text" Value="Inactive"/>
+                                                        <Setter Property="Foreground" Value="#585B70"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </Border>
+                            </StackPanel>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+            </DataGrid.Columns>
+        </DataGrid>
+
+        <!-- Selected station notes -->
+        <Border Grid.Row="3"
+                Background="#313244" CornerRadius="6" Padding="12,8"
+                Margin="0,0,0,10"
+                MinHeight="52">
+            <StackPanel>
+                <TextBlock Text="Notes" Foreground="#89B4FA" FontSize="11" FontWeight="SemiBold" Margin="0,0,0,3"/>
+                <TextBlock x:Name="NotesBlock"
+                           Text="Select a row to see notes."
+                           TextWrapping="Wrap"
+                           Foreground="#A6ADC8"
+                           FontSize="12"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Close button -->
+        <Button Grid.Row="4"
+                Content="Close"
+                HorizontalAlignment="Right"
+                Width="90" Height="32"
+                Background="#89B4FA"
+                Foreground="#1E1E2E"
+                FontWeight="SemiBold"
+                BorderThickness="0"
+                Cursor="Hand"
+                Click="Close_Click">
+            <Button.Template>
+                <ControlTemplate TargetType="Button">
+                    <Border Background="{TemplateBinding Background}" CornerRadius="5" Padding="8,4">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter Property="Background" Value="#B4D0FF"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Button.Template>
+        </Button>
+    </Grid>
+</Window>
