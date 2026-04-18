@@ -2,6 +2,7 @@
 
 > **Under Development — Not Fully Functional**
 > This project is a work in progress. Core decoding works under good signal conditions, but performance under weak or fading HF signals is still being improved. Expect bugs, incomplete features, and breaking changes. Not recommended for production use.
+<img width="787" height="1345" alt="Screenshot 2026-04-17 222022" src="https://github.com/user-attachments/assets/99a63b3c-f924-4aab-bfe7-5c516873457f" />
 
 A Windows desktop application that decodes UTC time from HF radio time-signal stations (WWV, WWVH, BPM) by processing audio input in real time. Feed it audio from a shortwave receiver or online SDR tuned to a supported station and it will extract the BCD-encoded time, display decoded UTC, and optionally set your system clock.
 
