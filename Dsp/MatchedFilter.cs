@@ -20,18 +20,18 @@ namespace WwvDecoder.Dsp;
 ///   (−10 dB), so the midpoint (50%) cleanly separates LOW from HIGH while being
 ///   robust to the synchronous detector's ~20 ms envelope transitions.
 ///
-/// Classification boundaries — calibrated against observed effective durations:
-///   The sync detector's 2 Hz lowpass (τ ≈ 80 ms) delays the envelope response, so
-///   the energy-weighted d value is systematically shorter than the raw LOW duration.
-///   Observed d distributions from SDR testing (22050 Hz, 2 Hz LP after PLL lock):
-///     Zero   (nominal 200 ms LOW): d ≈ 0.10–0.13 s
-///     One    (nominal 500 ms LOW): d ≈ 0.34–0.42 s
-///     Marker (nominal 800 ms LOW): d ≈ 0.58–0.71 s
-///   Boundaries placed at the midpoints of the observed gaps:
-///   &lt; 80 ms   → Tick   (noise glitch)
-///   80–220 ms → Zero   (nominal 200 ms LOW)
-///   220–500 ms → One   (nominal 500 ms LOW)
-///   ≥ 500 ms  → Marker (nominal 800 ms LOW)
+/// Classification boundaries (binary count, modulation-depth-independent):
+///   d ≈ time the envelope spent below midThreshold (50 % of levelHigh).
+///   For the 2 Hz LP (τ≈80 ms) used after PLL lock, the envelope takes ~120 ms to
+///   cross enterThreshold (47 %) downward, so d is shorter than the raw LOW period:
+///     Zero   (200 ms LOW): d ≈ 0.10–0.18 s   (2 Hz LP: ~106 ms; 8 Hz LP: ~176 ms)
+///     One    (500 ms LOW): d ≈ 0.38–0.48 s   (2 Hz LP: ~406 ms; 8 Hz LP: ~476 ms)
+///     Marker (800 ms LOW): d ≈ 0.68–0.78 s   (2 Hz LP: ~706 ms; 8 Hz LP: ~776 ms)
+///   Boundaries placed at gaps between the ranges:
+///   &lt; 50 ms   → Tick   (noise glitch or post-refractory artifact)
+///   50–220 ms → Zero   (nominal 200 ms LOW)
+///   220–560 ms → One   (nominal 500 ms LOW)
+///   ≥ 560 ms  → Marker (nominal 800 ms LOW)
 ///
 /// Usage: call Classify() at the end of a detected pulse, passing the envelope
 /// samples accumulated during the LOW period plus the current levelHigh reference.
@@ -73,40 +73,56 @@ public static class MatchedFilter
                                                    int sampleRate, double levelHighAtPulseStart)
     {
         double midThreshold = levelHighAtPulseStart * 0.50;
-        double energyLow    = 0.0;
-        double energyTotal  = midThreshold * envelopeSamples.Count;
+        int belowCount = 0;
         foreach (double s in envelopeSamples)
-            energyLow += Math.Max(0.0, midThreshold - s);
-        double lowFraction = energyTotal > 0 ? energyLow / energyTotal : 0.0;
-        return lowFraction * envelopeSamples.Count / sampleRate;
+            if (s < midThreshold) belowCount++;
+        return (double)belowCount / sampleRate;
     }
 
     public static (PulseType Type, double Confidence, double EffectiveDuration) ClassifyWithConfidence(
         IReadOnlyList<double> envelopeSamples, int sampleRate, double levelHighAtPulseStart)
     {
-        // Integrate-and-dump matched filter: weight each sample by how far it sits
-        // below the mid-threshold, not merely whether it crosses it.
-        // A sample at 5% of HIGH contributes far more energy than one at 49%, so
-        // borderline re-entries from noise (which hover just under the threshold)
-        // have little effect on the classification. This is the optimal matched
-        // filter for a rectangular pulse template in AWGN.
+        // Binary count matched filter: count samples that lie below the midpoint
+        // threshold (50% of levelHigh). This is modulation-depth-independent — it
+        // gives d ≈ actual LOW duration whether the carrier drops to 31% (clean
+        // synthetic signal) or near zero (HF propagation fading). The energy-
+        // weighted approach (sum of midThreshold − s) scales with modulation depth,
+        // causing a 0.316-amplitude LOW to produce d ≈ 0.37 × duration, which
+        // misclassifies Markers as Ones for clean signals.
+        //
+        // Equivalently this is a binary matched filter against a rectangular template:
+        // each sample votes "LOW" (1) or "HIGH" (0) with no partial weight.
         double midThreshold = levelHighAtPulseStart * 0.50;
-        double energyLow    = 0.0;
-        double energyTotal  = midThreshold * envelopeSamples.Count; // max possible
+        int belowCount = 0;
         foreach (double s in envelopeSamples)
-            energyLow += Math.Max(0.0, midThreshold - s);
+            if (s < midThreshold) belowCount++;
 
-        // Normalise to an effective duration: fraction of max energy × buffer duration.
-        double lowFraction = energyTotal > 0 ? energyLow / energyTotal : 0.0;
-        double d = lowFraction * envelopeSamples.Count / sampleRate; // effective LOW duration
+        double d = (double)belowCount / sampleRate; // effective LOW duration
 
-        // Boundaries derived from observed d-value distributions (see class comment).
-        // Scale = 80 ms (half-width of the narrowest class, Zero = 0.08–0.22 s, half-width 0.07 s).
-        // A pulse whose d sits ≥ scale from the nearest boundary gets confidence 1.0.
-        const double tTick   = 0.08;  // Tick/Zero boundary
-        const double tZeroOne = 0.22; // Zero/One boundary
-        const double tOneMrk = 0.50; // One/Marker boundary
-        const double scale   = 0.08;
+        // Boundaries calibrated from live SDR measurements of real WWV (Fort Collins) via
+        // VB-Audio virtual cable routing, 2 Hz LP after PLL lock.
+        //
+        // Observed d-value distributions (WWV spec: 0.170 / 0.470 / 0.770 s LOW):
+        //   Zero   d ≈ 0.21–0.23 s  → lower bound 50 ms,  upper bound 350 ms
+        //   One    d ≈ 0.52–0.54 s  → lower bound 350 ms, upper bound 650 ms
+        //   Marker d ≈ 0.77–0.80 s  → lower bound 650 ms
+        //
+        // The observed d-values are higher than the theoretical (LP-subtracted) predictions
+        // because the coherent SynchronousDetector + ALE processing chain produces a faster
+        // effective envelope response than a simple RC lowpass model predicts.
+        //
+        // With these boundaries:
+        //   Zero   d=0.22 s → conf = min(0.17, 0.13)/0.08 = 1.0  (was 0.02 at old 0.220 boundary)
+        //   One    d=0.53 s → conf = min(0.18, 0.12)/0.08 = 1.0  (was marginal at old 0.560 boundary)
+        //   Marker d=0.77 s → conf = (0.77−0.65)/0.08     = 1.0
+        //
+        // Tick/Zero at 50 ms: post-Marker refractory (150 ms) can truncate the first Zero
+        // after a Marker to d ≈ 40–45 ms.  At 50 ms those become Ticks (discarded);
+        // gap-fill inserts the correct 0 instead of a low-confidence erasure.
+        const double tTick    = 0.050; // Tick/Zero boundary
+        const double tZeroOne = 0.350; // Zero/One boundary  (raised from 0.220)
+        const double tOneMrk  = 0.650; // One/Marker boundary (raised from 0.560)
+        const double scale    = 0.080;
 
         if (d < tTick)
             return (PulseType.Tick, 0.0, d);

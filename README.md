@@ -1,7 +1,9 @@
 # RadioTime Decoder
 
-> **Under Development — Not Fully Functional**
-> This project is a work in progress. Core decoding works under good signal conditions, but performance under weak or fading HF signals is still being improved. Expect bugs, incomplete features, and breaking changes. Not recommended for production use.
+> [!WARNING]
+> **This program is under active development and is not yet reliable.**
+> Decoding under real HF propagation conditions is inconsistent — ionospheric fading routinely corrupts 50–90% of each 60-bit frame, and decoded times may be wrong or absent. The software is shared for development and experimentation purposes only. Do not use it as a time reference for anything that matters.
+
 <img width="787" height="1345" alt="Screenshot 2026-04-17 222022" src="https://github.com/user-attachments/assets/99a63b3c-f924-4aab-bfe7-5c516873457f" />
 
 A Windows desktop application that decodes UTC time from HF radio time-signal stations (WWV, WWVH, BPM) by processing audio input in real time. Feed it audio from a shortwave receiver or online SDR tuned to a supported station and it will extract the BCD-encoded time, display decoded UTC, and optionally set your system clock.
@@ -211,9 +213,9 @@ Each second of the WWV broadcast encodes one bit via the duration of a **reduced
 
 | Bit Value | LOW Duration | HIGH Duration | Meaning |
 |-----------|-------------|---------------|---------|
-| 0 (Zero) | 0.2 s | 0.8 s | Binary 0 |
-| 1 (One) | 0.5 s | 0.5 s | Binary 1 |
-| Marker | 0.8 s | 0.2 s | Frame position marker |
+| 0 (Zero) | 0.170 s | ~0.830 s | Binary 0 |
+| 1 (One) | 0.470 s | ~0.530 s | Binary 1 |
+| Marker | 0.770 s | ~0.230 s | Frame position marker |
 
 In addition, WWV broadcasts **1000 Hz tone bursts** at the start of each second (5 ms ticks) and the start of each minute (800 ms minute pulse). These carry no BCD data but provide precise second-epoch timing and an unambiguous P0 anchor.
 
@@ -261,7 +263,7 @@ Audio In (22,050 Hz, 16-bit mono, 50 ms blocks)
 [5] Synchronous (Lock-In) Detector            [8] Tick Detector
     │  IQ demodulation at 100 Hz                  │  IQ demodulation at 1000 Hz
     │  Lowpass: 8 Hz (acquisition)                │  Lowpass: 150 Hz (resolves 5 ms tick)
-    │  → 5 Hz after PLL lock                      │  Adaptive level: 2 ms attack / 3 s decay
+    │  → 2 Hz after PLL lock                      │  Adaptive level: 2 ms attack / 3 s decay
     │  Envelope = 2·√(I²+Q²)                      │  Classifies:
     │  SNR improvement: 15–25 dB                  │    ≤50 ms  → SecondTick (5 ms tick)
     │                                             │    ≥500 ms → MinutePulse (P0 anchor)
@@ -301,7 +303,7 @@ Audio In (22,050 Hz, 16-bit mono, 50 ms blocks)
     │   — Missing expected marker at positions 9, 19, 29, 39, 49 → Searching within 10 s
     │
     ▼
-[10] Erasure-Aware Multi-Frame Accumulator (ring buffer, depth 3)
+[10] Erasure-Aware Multi-Frame Accumulator (ring buffer, depth 5 fast / 15 slow)
     │
     │  Each stored bit is tagged confident or erased:
     │    Confident: pulse received, MatchedFilter and duration classifiers agreed
@@ -373,7 +375,7 @@ SDR receivers have local oscillator errors of 0.5–5 Hz. Even a 4 Hz offset cau
 
 - **Frequency discriminator:** measures the angular rotation rate of the IQ vector between blocks. `cross = I₀·Q₁ − Q₀·I₁ ≈ A²·sin(Δφ)`, from which the frequency error is `−atan2(cross, dot) / (2π·blockDuration)` in Hz.
 - **PI loop filter:** a proportional term tracks fast transients; an integral term eliminates steady-state offset.
-- **Lock detection:** declared after 5 consecutive blocks with `|freqError| < 0.5 Hz`. On lock, the synchronous detector's lowpass is narrowed from 8 Hz to 5 Hz, improving noise rejection. On loss of lock it widens immediately for re-acquisition.
+- **Lock detection:** declared after 5 consecutive blocks with `|freqError| < 0.5 Hz`. On lock, the synchronous detector's lowpass is narrowed from 8 Hz to 2 Hz, improving noise rejection. On loss of lock it widens immediately for re-acquisition.
 - **Gating:** PLL updates are skipped during pulse LOW periods (I ≈ Q ≈ 0) to prevent spurious phase jumps from a near-zero IQ vector.
 
 #### Pulse Detector
@@ -388,7 +390,7 @@ A **weak-signal guard** suppresses all pulse detection while the HIGH level is l
 #### Matched Filter
 At the end of each detected pulse, the matched filter classifies it by counting how many envelope samples were below the midpoint between HIGH and LOW carrier levels (50% of HIGH). This "energy counting" is equivalent to correlating the envelope against a rectangular template for each pulse type — the optimal classifier in white Gaussian noise.
 
-This eliminates a systematic positive-duration bias: simple threshold-crossing measurement includes the ~20 ms envelope rise and fall times, making a 200 ms Zero pulse appear 40 ms longer than it is. The matched filter counts only samples genuinely in the LOW state, removing this bias. Classification boundaries are: < 100 ms = Tick, 100–350 ms = Zero, 350–650 ms = One, ≥ 650 ms = Marker.
+This eliminates a systematic positive-duration bias: simple threshold-crossing measurement includes the ~20 ms envelope rise and fall times, making a 200 ms Zero pulse appear 40 ms longer than it is. The matched filter counts only samples genuinely in the LOW state, removing this bias. Classification boundaries are: < 50 ms = Tick, 50–350 ms = Zero, 350–650 ms = One, ≥ 650 ms = Marker.
 
 The midpoint threshold uses the `levelHigh` snapshot taken just before the pulse started, not the end-of-pulse value. During an 800 ms Marker's LOW period, the 3-second exponential decay would reduce `levelHigh` to 76% of its true value, dropping the midpoint to 38% — dangerously close to the actual LOW carrier level at 31%. The pre-pulse snapshot keeps a clean reference throughout.
 
@@ -425,7 +427,7 @@ This prevents the reset loop caused by marker-length noise during deep fades (wh
 During deep ionospheric fades the 100 Hz carrier can drop for ~0.8 s during what should be 0.2 s Zero or 0.5 s One periods, causing almost all pulses to be classified as Markers. Normal WWV has 7/60 = 11.7% Markers. When more than 60% of the last 20 pulses are Markers, the gate pauses all anchor attempts — log activity stops, no more "bad gap" spam. The gate recovers below 25% Marker rate (hysteresis to prevent rapid oscillation). If signal has been entirely absent for more than 20 seconds, the gate resets immediately — the propagation window has changed and stale measurements should not block a fresh start.
 
 #### Erasure-Aware Multi-Frame Accumulation
-A ring buffer holds the 3 most recent raw 60-bit frames. Each bit position is tagged **confident** or **erased**:
+A ring buffer holds the 5 most recent raw 60-bit frames (15 frames for slowly-changing fields: DOY, year, DUT1, DST, leap). Each bit position is tagged **confident** or **erased**:
 
 - **Confident:** the bit was received from an actual pulse and both the MatchedFilter and duration classifiers agreed on its type
 - **Erased:** the position was gap-filled during a fade, or the two classifiers disagreed (ambiguous pulse)

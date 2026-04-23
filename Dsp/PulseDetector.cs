@@ -40,6 +40,29 @@ public class PulseDetector
     private readonly double _highAttack;     // per-sample rise for _levelHigh (100 ms — filters ~5 ms tick spikes)
     private readonly double _highFastAttack; // per-sample rise for _levelHigh (30 ms) — post-fade snap-back
     private readonly int _maxPulseSamples;   // 1.1 s — force-end any impossible-length pulse
+    // After an 800 ms Marker the LP filter starts the next second at ~0.944 (post-AGC
+    // equivalent), taking ~107 ms to fall to enterThreshold.  Without a refractory
+    // window the detector enters the first data pulse at 107 ms, but the LP hasn't fallen
+    // far enough below midThreshold to accumulate d ≥ 50 ms → Tick classification.
+    //
+    // With a 150 ms refractory (from pulse end): the Marker pulse fires at ~857 ms into
+    // its second, so 150 ms later = 1007 ms = 7 ms into the next second.  The LP is
+    // still above enterThreshold at 7 ms (~0.938 vs threshold ~0.229), so the detector
+    // waits until the LP falls to enterThreshold at ~107 ms.  The pulse then runs to
+    // the end of the LOW period, accumulating d well above the Tick/Zero boundary.
+    //
+    // Minimum gap to next legitimate crossing for non-Marker pulses:
+    //   After Zero (200 ms LOW): pulse fires at ~257 ms → gap to next enter ≈ 850 ms >> 150 ms. ✓
+    //   After One  (500 ms LOW): pulse fires at ~557 ms → gap to next enter ≈ 550 ms >> 150 ms. ✓
+    private readonly int _refractorySamples; // 150 ms
+    private int _refractory;
+
+    // Amplitude variability: exponential average of envelope deviation from levelHigh
+    // during HIGH periods. High values indicate rapid HF fading that the 2 Hz LP cannot
+    // track. Used to adaptively widen the sync detector lowpass from 2 → 8 Hz.
+    private double _amplitudeVariability;
+    private readonly double _varAlpha;  // τ ≈ 3 s
+    private bool _isAmplitudeUnstable;  // hysteresis state: engage at 0.30, disengage at 0.15
 
     // Fade detector: flag when the signal has been absent for > 200 ms and hasn't
     // yet recovered.  Pulses emitted while IsFading get confidence=0 (erasure weight)
@@ -69,10 +92,18 @@ public class PulseDetector
     private readonly List<double> _pulseBuffer = new();
 
     public event Action<PulseEvent>? PulseDetected;
+    public Action<string>? OnLog { get; set; }
 
     public double CurrentEnvelope { get; private set; }
     public double PeakEnvelope => _peakEnvelope;
     public double LevelHigh => _levelHigh;
+
+    /// <summary>
+    /// True when the carrier amplitude is varying too rapidly for the 2 Hz LP filter
+    /// to track — the hallmark of HF multipath fading at 1–3 Hz rates.
+    /// Engages when the 3 s–smoothed relative deviation exceeds 30 %; clears at 15 %.
+    /// </summary>
+    public bool IsAmplitudeUnstable => _isAmplitudeUnstable;
 
     public PulseDetector(int sampleRate, SynchronousDetector detector)
     {
@@ -84,19 +115,14 @@ public class PulseDetector
         // Per-sample multiplier for exponential decay: e^{-1/(τ·sr)} ≈ 0.99999.
         // NOTE: this is Math.Exp(...), NOT 1-Math.Exp(...).  Using 1-exp would give
         // ~1.5e-5 per sample, collapsing _levelHigh to zero in a single step.
-        _highDecay  = Math.Exp(-1.0 / (3.000 * sampleRate)); // 3 s decay (≈0.999985)
+        //
+        // 3 s decay: applied when the envelope dips below levelHigh (signal fade or
+        // pulse LOW period). Fast enough to track ionospheric fading without causing
+        // exitThreshold to lag so far behind the carrier that pulses fail to close.
+        // The MatchedFilter uses _levelHighAtPulseStart (snapshot taken before any
+        // in-pulse decay) so the classification reference is always clean.
+        _highDecay  = Math.Exp(-1.0 / (3.0 * sampleRate));
         // 100 ms attack, applied only during HIGH periods (not in pulse) — see ProcessBlock.
-        // Gating the attack to HIGH-only periods means noise/ticks during LOW cannot inflate
-        // _levelHigh. The 100 ms τ recovers 86.5% of the gap to true carrier in a single
-        // 200 ms HIGH window (the shortest HIGH period, after an 800 ms Marker):
-        //   76% (after LOW decay) + 0.865 × 24% = 96.7% of true carrier.
-        //   exitThreshold = 0.62 × 96.7% = 60% of carrier — 29% above LOW (31%). ✓
-        // Reduced from 200 ms (which only recovered 63%) because after ionospheric fades the
-        // 0.2 s HIGH window must be enough to pull enterThreshold above the LOW carrier (31%).
-        // With 200 ms: enterThreshold = 0.47 × 91% = 42.8% — barely above LOW after a pre-fade
-        // depressed levelHigh. With 100 ms: 0.47 × 96.7% = 45.4% — more reliable margin.
-        // The 3 s decay runs during LOW periods (when the attack branch is skipped),
-        // so _levelHigh holds steady during pulses rather than collapsing.
         _highAttack     = 1.0 - Math.Exp(-1.0 / (0.100 * sampleRate));
         // 30 ms fast-recovery attack: activates when the envelope is more than 1.5× above
         // levelHigh — the signature of post-fade carrier recovery.  Under normal conditions
@@ -106,6 +132,23 @@ public class PulseDetector
         _highFastAttack = 1.0 - Math.Exp(-1.0 / (0.030 * sampleRate));
         _fadeMinSamples         = sampleRate * 200 / 1000; // 200 ms
         _fadeRecoveryMinSamples = sampleRate * 500 / 1000; // 500 ms
+        _refractorySamples      = sampleRate * 150 / 1000; // 150 ms
+        _varAlpha               = 1.0 - Math.Exp(-1.0 / (3.0 * sampleRate));
+    }
+
+    /// <summary>
+    /// Discard any pulse currently in progress without emitting it.
+    /// Called on minute-pulse re-anchor so the P0 Marker can be detected
+    /// fresh rather than being consumed by an OVERFLOW of the P59 pulse.
+    /// Refractory is cleared so the P0 LOW period is entered immediately.
+    /// </summary>
+    public void AbortCurrentPulse()
+    {
+        _inPulse      = false;
+        _pulseSamples = 0;
+        _gapSamples   = 0;
+        _pulseBuffer.Clear();
+        _refractory   = 0; // don't gate P0 detection
     }
 
     public void Reset()
@@ -120,6 +163,9 @@ public class PulseDetector
         _consecutiveLowSamples = 0;
         _fadeRecoverySamples   = 0;
         IsFading               = false;
+        _refractory            = 0;
+        _amplitudeVariability  = 0;
+        _isAmplitudeUnstable   = false;
     }
 
     public void ProcessBlock(float[] envelopeSamples)
@@ -130,12 +176,11 @@ public class PulseDetector
             if (sample > _peakEnvelope) _peakEnvelope = sample;
             _peakEnvelope *= 0.9999;
 
-            // Track carrier HIGH level — attack ONLY during HIGH periods (not in pulse).
-            // Gating the attack prevents LOW-period noise and ticks from inflating _levelHigh,
-            // which would push exitThreshold above the carrier level and lock the detector.
-            // During LOW periods the 3 s decay runs, keeping _levelHigh stable (decays only
-            // ~24% over an 800 ms Marker LOW period). The maxPulseSamples cap breaks stuck
-            // states so _levelHigh can recover even after a spurious long-LOW lockup.
+            // Track carrier HIGH level. Attack is gated to !_inPulse so LOW-period noise
+            // and ticks cannot inflate _levelHigh and push exitThreshold above the carrier.
+            // The 3 s decay runs in both HIGH-period dips and pulse LOW periods; _levelHighAtPulseStart
+            // (snapshot at pulse entry) is what the MatchedFilter uses, so in-pulse decay
+            // does not bias classification. The maxPulseSamples cap breaks any stuck-LOW state.
             if (!_inPulse)
             {
                 if (sample > _levelHigh)
@@ -144,7 +189,11 @@ public class PulseDetector
                     // the carrier has returned from a deep fade — snap the tracker back in
                     // ~30 ms instead of the normal 100 ms so exit/enter thresholds recover
                     // before the first returned pulse arrives.
-                    double attack = sample > _levelHigh * 1.5 ? _highFastAttack : _highAttack;
+                    // Threshold lowered 1.5 → 1.2: after a 1.1s OVERFLOW levelHigh decays to
+                    // ~69% of true carrier. The returning carrier (1.0 × true) gives ratio
+                    // 1/0.69 ≈ 1.45, which was just below the old 1.5 trigger, causing slow
+                    // attack (100ms τ) when fast attack (30ms τ) is needed.
+                    double attack = sample > _levelHigh * 1.2 ? _highFastAttack : _highAttack;
                     _levelHigh += attack * (sample - _levelHigh);
                 }
                 else
@@ -160,12 +209,20 @@ public class PulseDetector
             // sit well between the two states with a 15% dead-band to prevent chattering
             // on the synchronous detector's ~20 ms envelope transitions.
             //
-            // Weak signal guard: if _levelHigh < 3× noise floor, exitThreshold (70% of
+            // Weak signal guard: if _levelHigh < 3× noise floor, exitThreshold (62% of
             // levelHigh) may fall below the actual carrier HIGH level, making it
             // unreachable. Every pulse then runs to the 1.1 s safety cap and gets
             // classified as Marker. Suppress detection entirely until the carrier is
             // established — garbage output is worse than no output.
-            double noise = _detector.NoiseFloor;
+            //
+            // Cap the effective noise reference at 10 % of _levelHigh. In real HF the
+            // true noise floor is always well below 10 % of the carrier (20 dB+ SNR
+            // for any decodable signal). The SynchronousDetector's noise estimator can
+            // erroneously drift toward the carrier level when no truly quiet period
+            // exists (e.g. clean simulation signals where the LOW carrier is 0.316 —
+            // still above the initial noise floor), which would then suppress detection
+            // during Marker LOW periods as _levelHigh decays to 0.765 of its peak.
+            double noise = Math.Min(_detector.NoiseFloor, _levelHigh * 0.10);
             bool hasSignal = _levelHigh > noise * 3.0;
 
             if (!hasSignal)
@@ -202,19 +259,38 @@ public class PulseDetector
                 _fadeRecoverySamples = 0;
             }
 
+            // Track amplitude variability during HIGH periods (not in pulse).
+            // relDev = |envelope − levelHigh| / levelHigh; smoothed over ~3 s.
+            // Large values mean the carrier is fading faster than the 2 Hz LP can follow.
+            // Hysteresis: engage at 0.30, disengage at 0.15 — prevents chattering.
+            if (!_inPulse && _levelHigh > 1e-6)
+            {
+                double relDev = Math.Abs(sample - _levelHigh) / _levelHigh;
+                _amplitudeVariability += _varAlpha * (relDev - _amplitudeVariability);
+                if      (_amplitudeVariability > 0.30) _isAmplitudeUnstable = true;
+                else if (_amplitudeVariability < 0.15) _isAmplitudeUnstable = false;
+            }
+
             // Thresholds as fractions of _levelHigh.
             // WWV LOW ≈ 31% of HIGH. Dead-band (enter↔exit gap) prevents chattering.
-            //   Enter: 47% — safely above LOW (31%), starts pulse detection
+            //   Enter: 55% — well above LOW (31%); detects pulse even when LH is depressed
+            //           post-Marker (LH≈76% of carrier → enterThr=42% of carrier, still > 31%)
             //   Exit:  62% — safely below HIGH (100%), ends pulse detection
             // With the gated-HIGH-only attack, noise/ticks during LOW cannot inflate
             // _levelHigh, so exitThreshold stays well below the carrier HIGH level.
-            double enterThreshold = _levelHigh * 0.47;
+            double enterThreshold = _levelHigh * 0.55;
             double exitThreshold  = _levelHigh * 0.62;
 
             if (!_inPulse)
             {
+                // Refractory period: suppress new pulse entry immediately after a pulse ends
+                // to prevent ALE adaptation transients from generating spurious Ticks.
+                if (_refractory > 0)
+                {
+                    _refractory--;
+                }
                 // Not in a pulse — enter LOW state when signal drops below enter threshold
-                if (sample < enterThreshold)
+                else if (sample < enterThreshold)
                 {
                     _inPulse = true;
                     _pulseSamples = 1;
@@ -230,10 +306,12 @@ public class PulseDetector
                 // for more than 1.1 s the detector is stuck — discard and reset.
                 if (_pulseSamples > _maxPulseSamples)
                 {
+                    OnLog?.Invoke($"[PulseDetector] OVERFLOW discard: pulseSamples={_pulseSamples} ({(double)_pulseSamples/_sampleRate*1000:F1}ms) > max={_maxPulseSamples}");
                     _inPulse = false;
                     _pulseSamples = 0;
                     _gapSamples = 0;
                     _pulseBuffer.Clear();
+                    _refractory = _refractorySamples;
                 }
                 // In a pulse — only exit when signal clearly rises above exit threshold
                 else if (sample > exitThreshold)
@@ -263,9 +341,17 @@ public class PulseDetector
                             // signal (not just the pulse buffer, so the spike-inflation concern
                             // in MatchedFilter's comment does not apply).  Factor 0.9 gives
                             // midThreshold = 0.45×true_HIGH — above LOW (0.316) and below HIGH.
-                            double referenceLevel = _peakEnvelope > _levelHighAtPulseStart * 1.5
-                                ? _peakEnvelope * 0.9
-                                : _levelHighAtPulseStart;
+                            // Always use the level snapshot taken at pulse start.
+                            // midThreshold = 0.5×levelHighAtPulseStart correctly separates
+                            // the LOW carrier (0.316×LH) from the HIGH carrier (≈LH) in all
+                            // normal conditions.  The fast-attack branch (30 ms when envelope
+                            // > 1.5×LH) snaps levelHigh back within one HIGH window after a
+                            // fade, so levelHighAtPulseStart is reliable by the next pulse.
+                            // A peakEnvelope-based correction was previously used here but
+                            // raised midThreshold to 0.75×LH when peakEnvelope was stale
+                            // (AGC lag after a signal drop), causing One pulses to misclassify
+                            // as Marker (d ≈ 0.53 s > tOneMrk 0.50 s).
+                            double referenceLevel = _levelHighAtPulseStart;
                             var (matchedType, confidence, effDuration) = MatchedFilter.ClassifyWithConfidence(
                                 _pulseBuffer, _sampleRate, referenceLevel);
                             // Zero confidence during fade recovery: the matched-filter reference
@@ -274,10 +360,15 @@ public class PulseDetector
                             double emitConfidence = IsFading ? 0.0 : confidence;
                             PulseDetected?.Invoke(new PulseEvent(pulseWidthSeconds, matchedType, emitConfidence, effDuration));
                         }
+                        else
+                        {
+                            OnLog?.Invoke($"[PulseDetector] SHORT discard: pulseSamples={_pulseSamples} ({(double)_pulseSamples/_sampleRate*1000:F1}ms)");
+                        }
                         _inPulse = false;
                         _pulseSamples = 0;
                         _gapSamples = 0;
                         _pulseBuffer.Clear();
+                        _refractory = _refractorySamples;
                     }
                 }
                 else

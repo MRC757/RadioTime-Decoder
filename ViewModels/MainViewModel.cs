@@ -119,9 +119,98 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     private AudioDeviceInfo? _selectedDevice;
     private StationInfo? _selectedStation;
 
+    private bool _autoSyncMinuteStart;
+    private string _lastMinuteSyncInfo = "";
+    private bool _enableInputAgc = true;
+    private bool _enableAle = true;
+    private bool _enableAdaptiveLowpass = true;
+    private double _inputTrimDb;
+    private double _syncScore;
+    private string _coarseCarrierDisplay = "100.0 Hz";
+    private string _agcGainDisplay = "0.0 dB";
+
+    /// <summary>
+    /// When true, the system clock's seconds field is zeroed automatically each time
+    /// the 1000 Hz minute pulse is detected. Useful for HF digital-mode software
+    /// (WSPR, FT8, JS8Call) that needs the minute boundary to be accurate.
+    /// No decoded frame is required — the minute pulse is detected independently of BCD decoding.
+    /// </summary>
+    public bool AutoSyncMinuteStart
+    {
+        get => _autoSyncMinuteStart;
+        set { _autoSyncMinuteStart = value; OnPropertyChanged(); }
+    }
+
+    /// <summary>Result of the most recent minute-start sync (shown next to the checkbox).</summary>
+    public string LastMinuteSyncInfo
+    {
+        get => _lastMinuteSyncInfo;
+        private set { _lastMinuteSyncInfo = value; OnPropertyChanged(); }
+    }
+
+    public bool EnableInputAgc
+    {
+        get => _enableInputAgc;
+        set { _enableInputAgc = value; OnPropertyChanged(); }
+    }
+
+    public bool EnableAle
+    {
+        get => _enableAle;
+        set { _enableAle = value; OnPropertyChanged(); }
+    }
+
+    public bool EnableAdaptiveLowpass
+    {
+        get => _enableAdaptiveLowpass;
+        set { _enableAdaptiveLowpass = value; OnPropertyChanged(); }
+    }
+
+    public double InputTrimDb
+    {
+        get => _inputTrimDb;
+        set
+        {
+            double rounded = Math.Round(Math.Clamp(value, -24.0, 24.0), 1);
+            if (Math.Abs(_inputTrimDb - rounded) < 0.001) return;
+            _inputTrimDb = rounded;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(InputTrimDisplay));
+        }
+    }
+
+    public string InputTrimDisplay => $"{_inputTrimDb:+0.0;-0.0;+0.0} dB";
+
+    public double SyncScore
+    {
+        get => _syncScore;
+        private set
+        {
+            _syncScore = value;
+            OnPropertyChanged();
+            OnPropertyChanged(nameof(SyncScoreDisplay));
+        }
+    }
+
+    public string SyncScoreDisplay => $"{_syncScore:F0}%";
+
+    public string CoarseCarrierDisplay
+    {
+        get => _coarseCarrierDisplay;
+        private set { _coarseCarrierDisplay = value; OnPropertyChanged(); }
+    }
+
+    public string AgcGainDisplay
+    {
+        get => _agcGainDisplay;
+        private set { _agcGainDisplay = value; OnPropertyChanged(); }
+    }
+
     public MainViewModel()
     {
-        _pipeline = new DecoderPipeline(OnSignalUpdate, OnFrameDecoded, msg => Log(msg), OnFrameUpdate);
+        _pipeline = new DecoderPipeline(OnSignalUpdate, OnFrameDecoded, msg => Log(msg), OnFrameUpdate,
+            getSettings: GetDecoderSettings);
+        _pipeline.MinutePulseDetected += OnMinutePulseDetected;
         LoadDevices();
         LoadStations();
 
@@ -484,6 +573,27 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
+    private void OnMinutePulseDetected(double pulseWidthSeconds)
+    {
+        if (!_autoSyncMinuteStart) return;
+        try
+        {
+            var delta = _timeSetter.SyncMinuteStart(pulseWidthSeconds);
+            // Pipeline uses Stopwatch (monotonic) for all timing — no adjustment needed after clock step.
+            string info = $"{DateTime.UtcNow:HH:mm} UTC  ({delta.TotalMilliseconds:+0.0;-0.0} ms)";
+            Application.Current?.Dispatcher.InvokeAsync(() =>
+            {
+                LastMinuteSyncInfo = info;
+                Log($"Minute-start sync: {info}");
+            });
+        }
+        catch (Exception ex)
+        {
+            Application.Current?.Dispatcher.InvokeAsync(() =>
+                Log($"Minute-start sync failed: {ex.Message}"));
+        }
+    }
+
     private void ApplyKnownDate()
     {
         if (DateTime.TryParseExact(_knownDateText, "yyyy-MM-dd",
@@ -517,6 +627,13 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             SubcarrierStrength = status.SubcarrierStrengthPercent;
             LockStrength = status.LockStrengthPercent;
             LockState = status.LockState;
+            SyncScore = status.SyncScorePercent;
+            CoarseCarrierDisplay = status.SyncScorePercent >= 5
+                ? $"{status.CoarseCarrierHz:F1} Hz"
+                : "--.- Hz";
+            AgcGainDisplay = status.AgcEnabled
+                ? $"{status.AgcGainDb:+0.0;-0.0;+0.0} dB"
+                : $"Bypass ({status.AgcGainDb:+0.0;-0.0;+0.0} dB trim)";
 
             if (status.FrameSecondsRemaining > 0)
                 CountdownDisplay = $"{status.FrameSecondsRemaining}s";
@@ -600,4 +717,11 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         _audioInput?.Dispose();
         _fileLogger?.Dispose();
     }
+
+    private DecoderRuntimeSettingsSnapshot GetDecoderSettings() =>
+        new(
+            EnableAgc: _enableInputAgc,
+            EnableAle: _enableAle,
+            EnableAdaptiveLowpass: _enableAdaptiveLowpass,
+            InputTrimDb: _inputTrimDb);
 }

@@ -221,8 +221,11 @@
         <local:BoolToStartStopColorConverter x:Key="BoolToStartStopColor"/>
         <local:LockStateToColorConverter x:Key="LockStateToColor"/>
         <local:LockStateToTextConverter x:Key="LockStateToText"/>
+        <local:NonEmptyToVisibleConverter x:Key="NonEmptyToVisible"/>
     </Window.Resources>
 
+    <ScrollViewer VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled">
     <Grid Margin="16">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -231,7 +234,8 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <!-- Title -->
@@ -411,10 +415,71 @@
             </Grid>
         </Border>
 
+        <!-- Advanced DSP -->
+        <Border Grid.Row="3" Style="{StaticResource PanelBorder}" Margin="0,0,0,10">
+            <StackPanel>
+                <TextBlock Text="Advanced DSP" Style="{StaticResource SectionHeader}"/>
+
+                <Grid Margin="0,0,0,8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="110"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="70"/>
+                    </Grid.ColumnDefinitions>
+
+                    <TextBlock Grid.Column="0" Text="Input Trim" Style="{StaticResource LabelStyle}"/>
+                    <Slider Grid.Column="1"
+                            Minimum="-24" Maximum="24"
+                            TickFrequency="6"
+                            Value="{Binding InputTrimDb, UpdateSourceTrigger=PropertyChanged}"
+                            VerticalAlignment="Center"/>
+                    <TextBlock Grid.Column="2"
+                               Text="{Binding InputTrimDisplay}"
+                               Style="{StaticResource LabelStyle}"
+                               HorizontalAlignment="Right"/>
+                </Grid>
+
+                <WrapPanel Margin="0,0,0,8">
+                    <CheckBox Content="AGC"
+                              IsChecked="{Binding EnableInputAgc}"
+                              Foreground="#CDD6F4"
+                              Margin="0,0,14,0"/>
+                    <CheckBox Content="ALE"
+                              IsChecked="{Binding EnableAle}"
+                              Foreground="#CDD6F4"
+                              Margin="0,0,14,0"/>
+                    <CheckBox Content="Adaptive LP"
+                              IsChecked="{Binding EnableAdaptiveLowpass}"
+                              Foreground="#CDD6F4"/>
+                </WrapPanel>
+
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <TextBlock Grid.Row="0" Grid.Column="0" Text="Sync Score" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock Grid.Row="1" Grid.Column="0" Text="{Binding SyncScoreDisplay}" FontSize="13" Foreground="#CDD6F4"/>
+
+                    <TextBlock Grid.Row="0" Grid.Column="1" Text="Coarse Carrier" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding CoarseCarrierDisplay}" FontSize="13" Foreground="#CDD6F4"/>
+
+                    <TextBlock Grid.Row="0" Grid.Column="2" Text="AGC / Trim" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock Grid.Row="1" Grid.Column="2" Text="{Binding AgcGainDisplay}" FontSize="13" Foreground="#CDD6F4"/>
+                </Grid>
+            </StackPanel>
+        </Border>
+
         <!-- Frame visualization: 60-cell color grid, one cell per BCD bit position.
              Colors: green=Confident, mauve=Erased, yellow=GapFilled, red=Corrected, grey=Empty.
              Hover a cell to see its position index, value (0/1/M), and classification state. -->
-        <Border Grid.Row="3" Style="{StaticResource PanelBorder}" Margin="0,0,0,10">
+        <Border Grid.Row="5" Style="{StaticResource PanelBorder}" Margin="0,0,0,10">
             <StackPanel>
                 <TextBlock Text="Frame Bits" Style="{StaticResource SectionHeader}"/>
                 <ItemsControl ItemsSource="{Binding FrameCells}">
@@ -522,8 +587,10 @@
         </Border>
 
         <!-- Buttons -->
-        <Grid Grid.Row="5" Margin="0,0,0,10">
+        <Grid Grid.Row="6" Margin="0,0,0,10">
             <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
@@ -550,10 +617,28 @@
                        FontSize="10" Foreground="#6C7086"
                        TextAlignment="Center" TextWrapping="Wrap"
                        Margin="0,5,0,0"/>
+
+            <!-- Minute-start sync for HF digital modes -->
+            <Border Grid.Row="2" Grid.ColumnSpan="3"
+                    Background="#2A2A3E" CornerRadius="5" Padding="10,7"
+                    Margin="0,8,0,0">
+                <StackPanel>
+                    <CheckBox Content="Auto-sync minute start  (for WSPR / FT8 / JS8Call)"
+                              IsChecked="{Binding AutoSyncMinuteStart}"
+                              Foreground="#CDD6F4" FontSize="12"/>
+                    <TextBlock Text="Zeroes the clock seconds at each detected WWV minute pulse without changing hours or minutes."
+                               FontSize="10" Foreground="#6C7086" TextWrapping="Wrap"
+                               Margin="20,3,0,0"/>
+                    <TextBlock Text="{Binding LastMinuteSyncInfo}"
+                               FontSize="10" Foreground="#A6E3A1"
+                               Margin="20,3,0,0"
+                               Visibility="{Binding LastMinuteSyncInfo, Converter={StaticResource NonEmptyToVisible}}"/>
+                </StackPanel>
+            </Border>
         </Grid>
 
         <!-- Log -->
-        <Border Grid.Row="6" Style="{StaticResource PanelBorder}">
+        <Border Grid.Row="7" Style="{StaticResource PanelBorder}">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
@@ -580,7 +665,7 @@
                          Foreground="#A6ADC8" TextWrapping="Wrap"
                          IsReadOnly="True" IsReadOnlyCaretVisible="True"
                          Background="Transparent" BorderThickness="0"
-                         Padding="0" Margin="0,4,0,0" MinHeight="80"
+                         Padding="0" Margin="0,4,0,0" MinHeight="160"
                          VerticalScrollBarVisibility="Auto"
                          HorizontalScrollBarVisibility="Disabled"
                          x:Name="LogTextBox">
@@ -596,4 +681,5 @@
             </Grid>
         </Border>
     </Grid>
+    </ScrollViewer>
 </Window>

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using WwvDecoder.Dsp;
 using WwvDecoder.ViewModels;
 
@@ -112,25 +113,39 @@ public class FrameDecoder
     // gaps are 10 seconds, so this anchor is unambiguous.
     // When the 1000 Hz tick detector fires a MinutePulse, this gap confirmation is
     // bypassed — the minute pulse is unambiguous without needing a second Marker.
-    private DateTime _candidateAnchorTime = DateTime.MinValue;
+    // 0 = not set (equivalent to DateTime.MinValue).
+    private long _candidateAnchorTick;
 
     // Per-bit state flags for the visualization grid (set in StoreBit / gap-fill / correction).
     private readonly bool[] _bitGapFilled = new bool[60];
     private readonly bool[] _bitCorrected = new bool[60];
 
-    // Wall-clock time of the most recent P0 anchor.
+    // Stopwatch tick of the most recent P0 anchor.
     // Used by the second-tick alignment check: tick N should arrive at approximately
-    // _anchorWallTime + N seconds. A discrepancy > 2 positions indicates the BCD
+    // _anchorWallTick + N seconds. A discrepancy > 2 positions indicates the BCD
     // bit counter has drifted (gap fills or double-triggers have shifted the index).
-    private DateTime _anchorWallTime = DateTime.MinValue;
+    // 0 = not set. Stopwatch timestamps are always positive.
+    private long _anchorWallTick;
 
-    // Concurrent P0 Marker absorb window.
+    // Pending 1000 Hz second-tick state.
+    // Each second tick (except 29 and 59, which are omitted per NIST) records the
+    // tick-derived bit index. The next 100 Hz BCD pulse is snapped to that position:
+    //   • gap between _bitIndex and target → fill with erasures then store normally
+    //   • _bitIndex ahead of target → pulse discarded (double-trigger absorbed extra bit)
+    //   • exact match → store normally
+    // This decouples bit-position tracking from pulse counting so a missed or extra BCD
+    // pulse does not shift all subsequent bits in the frame.
+    private int  _tickPendingBitIndex = -1; // -1 = no pending tick
+    private long _tickPendingTimestamp;
+
+    // Concurrent P0 Marker absorb window (deadline tick).
     // When OnTick(MinutePulse) anchors at P0 (bitIndex=1), the 100 Hz PulseDetector's
     // P0 Marker fires in the same or next audio block (~0–20 ms later, because the 1000 Hz
     // envelope exits its threshold ~8 ms before the 100 Hz envelope exits its threshold).
     // That 100 Hz Marker must be treated as a P0 confirmation, not stored as bit 1, or
     // CheckFrameCorrupted would immediately see consecutive Markers and reset to Searching.
-    private DateTime _skip100HzP0Until = DateTime.MinValue;
+    // 0 = window not active.
+    private long _skip100HzP0UntilTick;
 
     // Last known signal percent, cached so OnTick's ReportStatus call doesn't show 0%.
     private double _lastSignalPercent;
@@ -151,10 +166,25 @@ public class FrameDecoder
     private readonly Action<string>? _onLog;
     private readonly Action<FrameCell[]>? _onFrameUpdate;
 
+    // Monotonic clock for pulse timing. Defaults to _getTimestamp().
+    // Tests may inject a sample-based clock so timing works at simulation speed.
+    private readonly Func<long> _getTimestamp;
+
+    // Receiver mode detection: warn when broadband audio signal is present but the 100 Hz
+    // subcarrier level is consistently near zero, which is the signature of the receiver being
+    // tuned in SSB or narrow CW mode rather than AM. WWV requires AM (DSB-LC) to preserve
+    // the 100 Hz subcarrier. SSB strips the carrier entirely — nothing will ever decode.
+    private const double SubcarrierAbsentThreshold = 5.0;  // %
+    private const double AudioPresentThreshold     = 20.0; // % of peak
+    private const int    ReceiverModeCheckInterval = 200;  // audio blocks (~10 s at 50 ms/block)
+    private int _receiverModeCheckCount;
+    private int _subcarrierAbsentCount;
+    private bool _receiverModeWarned;
+
     // Signal metering
     private double _lockQuality; // 0..1
     private double _subcarrierPercent;
-    private DateTime _lastPulseTime = DateTime.UtcNow;
+    private long _lastPulseTick; // Stopwatch tick of most recent pulse; 0 = no pulse yet
 
     // Inter-pulse cadence guard.
     // WWV produces exactly one pulse per second.
@@ -167,7 +197,7 @@ public class FrameDecoder
     //     Use 0.35 s threshold so Marker→Zero pairs are NOT suppressed.
     //   After a Zero/One: shortest legitimate gap is One→Zero ≈ 0.53+0.23 = 0.76 s,
     //     well above the 0.50 s threshold used for those cases.
-    private DateTime _lastNonTickPulseTime = DateTime.MinValue;
+    private long _lastNonTickPulseTick; // Stopwatch tick; 0 = no pulse yet
     private PulseType _lastStoredPulseType = PulseType.Zero;
     private bool _lastPulseWasSynthetic; // set by tick gap fill; bypasses double-trigger check for the next real pulse
     private const double MinPulseGapAfterMarker  = 0.35;
@@ -176,12 +206,14 @@ public class FrameDecoder
     private const double ResetGapSeconds         = 30.0;
 
     public FrameDecoder(Action<SignalStatus> onSignalUpdate, Action<TimeFrame> onFrameDecoded,
-                        Action<string>? onLog = null, Action<FrameCell[]>? onFrameUpdate = null)
+                        Action<string>? onLog = null, Action<FrameCell[]>? onFrameUpdate = null,
+                        Func<long>? getTimestamp = null)
     {
         _onSignalUpdate  = onSignalUpdate;
         _onFrameDecoded  = onFrameDecoded;
         _onLog           = onLog;
         _onFrameUpdate   = onFrameUpdate;
+        _getTimestamp    = getTimestamp ?? Stopwatch.GetTimestamp;
     }
 
     public void Reset()
@@ -193,12 +225,12 @@ public class FrameDecoder
         _latestFrame = null;
         _lockQuality = 0;
         _subcarrierPercent = 0;
-        _lastPulseTime = DateTime.MinValue; // Force timeout on next CheckSignalTimeout call
+        _lastPulseTick = 0;
         _frameHistoryIndex = 0;
         _frameHistoryCount = 0;
         _slowFrameHistoryIndex = 0;
         _slowFrameHistoryCount = 0;
-        _lastNonTickPulseTime = DateTime.MinValue;
+        _lastNonTickPulseTick = 0;
         _lastStoredPulseType = PulseType.Zero;
         _lastPulseWasSynthetic = false;
         Array.Clear(_bitConfident, 0, 60);
@@ -209,9 +241,11 @@ public class FrameDecoder
         _frameTotal = 0;
         _clockExpected = null;
         _clockVerifiedCount = 0;
-        _candidateAnchorTime = DateTime.MinValue;
-        _anchorWallTime = DateTime.MinValue;
-        _skip100HzP0Until = DateTime.MinValue;
+        _candidateAnchorTick  = 0;
+        _anchorWallTick       = 0;
+        _skip100HzP0UntilTick = 0;
+        _tickPendingBitIndex  = -1;
+        _tickPendingTimestamp = 0;
         _lastSignalPercent = 0;
         _recentMarkerFlags.Clear();
         _signalTooFaded = false;
@@ -223,7 +257,7 @@ public class FrameDecoder
         // Update signal metering — peakEnvelope is the running peak amplitude from
         // PulseDetector, which correctly reflects signal strength during the pulse body
         // (not the near-zero value at pulse-end that CurrentEnvelope would give).
-        _lastPulseTime = DateTime.UtcNow;
+        _lastPulseTick = _getTimestamp();
         _subcarrierPercent = Math.Min(100, subcarrierLevel * 100.0);
         double snr = noiseFloor > 0 ? peakEnvelope / noiseFloor : 1.0;
         double signalPercent = Math.Min(100, snr * 10.0);
@@ -231,7 +265,12 @@ public class FrameDecoder
         ReportStatus(signalPercent);
 
         // Tick pulses (< 100 ms) are transition artifacts, not BCD data — skip them entirely.
-        if (pulse.Type == PulseType.Tick) return;
+        if (pulse.Type == PulseType.Tick)
+        {
+            if (_onLog != null && (_state == State.Syncing || _state == State.Locked))
+                _onLog($"[{_bitIndex:D2}] TICK (discarded) {pulse.WidthSeconds:F3}s d={pulse.EffectiveDuration:F3}s");
+            return;
+        }
 
         // Track per-frame hit/miss: confident = both classifiers agree.
         // Low hit rate indicates a faded minute — interpret output with caution.
@@ -255,7 +294,7 @@ public class FrameDecoder
                 || (_signalTooFaded && markerRate > MarkerSatLow);
             if (_signalTooFaded && !wasFaded)
             {
-                _candidateAnchorTime = DateTime.MinValue; // discard stale candidate
+                _candidateAnchorTick = 0; // discard stale candidate
                 _onLog?.Invoke($"Signal too faded ({markerRate:P0} Marker rate, last {MarkerRateWindowSize} pulses) — anchor paused");
             }
             else if (!_signalTooFaded && wasFaded)
@@ -294,10 +333,11 @@ public class FrameDecoder
         }
 
         // Inter-pulse cadence guard — enforce the 1-pulse-per-second cadence.
-        var now = DateTime.UtcNow;
-        if (_lastNonTickPulseTime != DateTime.MinValue)
+        // Stopwatch timestamps are monotonic — immune to system clock changes (e.g. minute-start sync).
+        long now = _getTimestamp();
+        if (_lastNonTickPulseTick != 0)
         {
-            double gap = (now - _lastNonTickPulseTime).TotalSeconds;
+            double gap = TicksToSeconds(now - _lastNonTickPulseTick);
 
             // Double-trigger: brief carrier recovery re-entered the LOW threshold within
             // the same second. The minimum gap threshold is smaller after a Marker because
@@ -364,21 +404,64 @@ public class FrameDecoder
         // exit threshold is 25% vs the 100 Hz's 62%, so the 1000 Hz falls faster).
         // If that P0 Marker were stored it would land at bitIndex=1, causing CheckFrameCorrupted
         // to see consecutive Markers at positions 0 and 1 and immediately reset.
-        if (_skip100HzP0Until != DateTime.MinValue)
+        if (_skip100HzP0UntilTick != 0)
         {
-            if (now <= _skip100HzP0Until && pulse.Type == PulseType.Marker && _bitIndex == 1)
+            if (now <= _skip100HzP0UntilTick && pulse.Type == PulseType.Marker && _bitIndex == 1)
             {
-                _skip100HzP0Until = DateTime.MinValue;
-                _lastNonTickPulseTime = now;
+                _skip100HzP0UntilTick = 0;
+                _lastNonTickPulseTick = now;
                 _lockQuality = Math.Min(1.0, _lockQuality + 0.10);
                 _onLog?.Invoke("[00] 100 Hz P0 confirmed (concurrent with minute pulse)");
                 return;
             }
             // Expired — clear
-            if (now > _skip100HzP0Until) _skip100HzP0Until = DateTime.MinValue;
+            if (now > _skip100HzP0UntilTick) _skip100HzP0UntilTick = 0;
         }
 
-        _lastNonTickPulseTime = now;
+        // Tick-derived bit alignment: snap _bitIndex to the position the most recent
+        // 1000 Hz second tick identified, provided the pulse arrives within the same
+        // one-second window as that tick.  This corrects drift from missed or extra
+        // 100 Hz BCD pulses without waiting for the large-drift gap-fill threshold.
+        if (_tickPendingBitIndex >= 0 && (_state == State.Syncing || _state == State.Locked))
+        {
+            double tickAge = TicksToSeconds(now - _tickPendingTimestamp);
+            if (tickAge < 0.95) // BCD pulse must arrive within one second of the tick
+            {
+                int target = _tickPendingBitIndex;
+                if (target > _bitIndex && target < 60)
+                {
+                    // Fill any skipped bit positions with erasures.
+                    _onLog?.Invoke($"Tick sync: fill [{_bitIndex:D2}]→[{target:D2}] ({target - _bitIndex} erased)");
+                    while (_bitIndex < target)
+                    {
+                        _bits[_bitIndex]         = IsExpectedMarkerPosition(_bitIndex) ? 2 : 0;
+                        _bitConfident[_bitIndex] = false;
+                        _bitWeight[_bitIndex]    = 0.0;
+                        _bitGapFilled[_bitIndex] = true;
+                        _bitIndex++;
+                    }
+                    PublishFrameVisualization();
+                    if (_bitIndex >= 60)
+                    {
+                        TryDecode(signalPercent);
+                        _tickPendingBitIndex = -1;
+                        return;
+                    }
+                }
+                else if (target < _bitIndex)
+                {
+                    // BCD counter ran ahead of the tick — a double-triggered pulse was
+                    // counted. Discard the current pulse; _bitIndex is already correct.
+                    _onLog?.Invoke($"Tick sync: pulse at [{_bitIndex:D2}] discarded (tick says [{target:D2}])");
+                    _tickPendingBitIndex = -1;
+                    return;
+                }
+                // target == _bitIndex: perfect alignment, no correction needed.
+            }
+            _tickPendingBitIndex = -1;
+        }
+
+        _lastNonTickPulseTick = now;
 
         switch (_state)
         {
@@ -387,15 +470,15 @@ public class FrameDecoder
 
                 if (pulse.Type == PulseType.Marker)
                 {
-                    if (_candidateAnchorTime == DateTime.MinValue)
+                    if (_candidateAnchorTick == 0)
                     {
                         // First Marker seen — record as candidate P0, wait for P1 to confirm.
-                        _candidateAnchorTime = now;
+                        _candidateAnchorTick = now;
                         _onLog?.Invoke($"Candidate P0 (width={pulse.WidthSeconds:F3}s) — waiting for P1 in ~9s");
                     }
                     else
                     {
-                        double interMarkerGap = (now - _candidateAnchorTime).TotalSeconds;
+                        double interMarkerGap = TicksToSeconds(now - _candidateAnchorTick);
                         if (interMarkerGap >= 8.5 && interMarkerGap <= 9.5)
                         {
                             // Confirmed P0→P1: the unique 9-second gap at the top of each minute.
@@ -423,9 +506,9 @@ public class FrameDecoder
                             _lastStoredPulseType = PulseType.Marker;
                             _lockQuality = 0.15; // partial credit for confirmed P0→P1 pair
                             _frameHits = 2; _frameTotal = 2; // two confirmed markers: P0 and P1
-                            _candidateAnchorTime = DateTime.MinValue;
-                            // Record P0 wall-clock time: P1 arrived now, P0 was ~9 s ago.
-                            _anchorWallTime = now.AddSeconds(-interMarkerGap);
+                            _candidateAnchorTick = 0;
+                            // Record P0 monotonic time: P1 arrived now, P0 was ~9 s ago.
+                            _anchorWallTick = now - SecondsToTicks(interMarkerGap);
                             _onLog?.Invoke($"Confirmed P0→P1 ({interMarkerGap:F1}s gap) → SYNCING at bit 10");
                             ReportStatus(signalPercent);
                             PublishFrameVisualization();
@@ -435,7 +518,7 @@ public class FrameDecoder
                             // ~10-second gap (P1→P2 or later) — valid inter-marker spacing, but
                             // we don't know which pair. Update candidate to current marker and keep
                             // looking; the next gap check may confirm P0→P1 of the next minute.
-                            _candidateAnchorTime = now;
+                            _candidateAnchorTick = now;
                             _onLog?.Invoke($"Inter-marker {interMarkerGap:F1}s (P1+ pair) — updating candidate");
                         }
                         else
@@ -445,7 +528,7 @@ public class FrameDecoder
                             // are obvious consecutive-Marker noise and clutter the log.
                             if (interMarkerGap >= 2.0)
                                 _onLog?.Invoke($"Bad gap {interMarkerGap:F1}s — reset candidate");
-                            _candidateAnchorTime = now;
+                            _candidateAnchorTick = now;
                         }
                     }
                 }
@@ -455,15 +538,24 @@ public class FrameDecoder
 
             case State.Syncing:
                 StoreBit(pulse);
-                // Downgrade to erasure when the matched filter's reference level was
-                // unreliable (levelHigh severely undertracked). A wrong confident vote
-                // from a multipath-distorted minute is worse than an erasure — it can
-                // outvote 4 clean frames in the 5-frame ring buffer.
+                // Downgrade confidence when levelHigh undertracked the true carrier.
+                // Graded: moderate undertracking (env/H 2.0–3.5) halves the vote weight
+                // so these bits participate with reduced influence; severe undertracking
+                // (env/H > 3.5) is a full erasure — the matched-filter reference is too
+                // unreliable to trust at all.
                 if (levelTrackRatio > 2.0 && _bitIndex > 0)
                 {
-                    _bitConfident[_bitIndex - 1] = false;
-                    _bitWeight[_bitIndex - 1]    = 0.0;
-                    _onLog?.Invoke($"[{_bitIndex - 1:D2}] Erased: env/H={levelTrackRatio:F1} — levelHigh undertracked");
+                    if (levelTrackRatio > 3.5)
+                    {
+                        _bitConfident[_bitIndex - 1] = false;
+                        _bitWeight[_bitIndex - 1]    = 0.0;
+                        _onLog?.Invoke($"[{_bitIndex - 1:D2}] Erased: env/H={levelTrackRatio:F1} — severe undertracking");
+                    }
+                    else
+                    {
+                        _bitWeight[_bitIndex - 1] *= 0.5;
+                        _onLog?.Invoke($"[{_bitIndex - 1:D2}] Downweighted ×0.5: env/H={levelTrackRatio:F1}");
+                    }
                 }
                 // Accumulate lock quality as markers appear at expected positions.
                 if (pulse.Type == PulseType.Marker && IsExpectedMarkerPosition(_bitIndex - 1))
@@ -508,9 +600,17 @@ public class FrameDecoder
                 StoreBit(pulse);
                 if (levelTrackRatio > 2.0 && _bitIndex > 0)
                 {
-                    _bitConfident[_bitIndex - 1] = false;
-                    _bitWeight[_bitIndex - 1]    = 0.0;
-                    _onLog?.Invoke($"[{_bitIndex - 1:D2}] Erased: env/H={levelTrackRatio:F1} — levelHigh undertracked");
+                    if (levelTrackRatio > 3.5)
+                    {
+                        _bitConfident[_bitIndex - 1] = false;
+                        _bitWeight[_bitIndex - 1]    = 0.0;
+                        _onLog?.Invoke($"[{_bitIndex - 1:D2}] Erased: env/H={levelTrackRatio:F1} — severe undertracking");
+                    }
+                    else
+                    {
+                        _bitWeight[_bitIndex - 1] *= 0.5;
+                        _onLog?.Invoke($"[{_bitIndex - 1:D2}] Downweighted ×0.5: env/H={levelTrackRatio:F1}");
+                    }
                 }
                 if (CheckFrameCorrupted(signalPercent)) break;
                 if (_bitIndex == 60)
@@ -540,33 +640,37 @@ public class FrameDecoder
         // for the bipolar matched filter from NTP driver 36.
         if (tick.Type == TickType.SecondTick)
         {
-            // Alignment verification AND tick-driven gap fill.
-            // The 1000 Hz tick fires at every second boundary, so elapsed seconds since
-            // anchor equals the bit index we should be at.  When the bit counter falls
-            // 3+ positions behind (HF fade killed several consecutive 100 Hz pulses and
-            // no 100 Hz pulse has fired to trigger the normal gap-fill path), advance
-            // _bitIndex here using the tick's timing rather than waiting for the next
-            // 100 Hz pulse.
-            //
-            // Safeguards:
-            //   — Only fire when drift ≥ 3 to absorb the ±1-s anchor wall-clock error.
-            //   — Only fill up to one position before the frame-complete boundary so
-            //     TryDecode is triggered by a real pulse, not by tick timing alone.
-            //   — The tick cadence guard (500 ms min) prevents false double-fills.
-            if (_anchorWallTime != DateTime.MinValue
-                && (_state == State.Syncing || _state == State.Locked)
-                && _bitIndex > 1)
+            // Only act when a P0 anchor is established and the frame is in progress.
+            if (_anchorWallTick == 0 || (_state != State.Syncing && _state != State.Locked))
+                return;
+
+            long tickNow = _getTimestamp();
+            double elapsed = TicksToSeconds(tickNow - _anchorWallTick);
+            int tickBit = (int)Math.Round(elapsed) % 60;
+
+            // NIST: the 29th and 59th second pulses are omitted from the 1000 Hz channel.
+            // The 100 Hz BCD channel still transmits position markers at those seconds;
+            // normal pulse counting handles them without tick guidance.
+            if (tickBit == 29 || tickBit == 59)
+                return;
+
+            // Record the tick-derived position. OnPulse will snap _bitIndex to this
+            // value when the next 100 Hz BCD pulse arrives (within a 950 ms window).
+            _tickPendingBitIndex  = tickBit;
+            _tickPendingTimestamp = tickNow;
+
+            // Large-drift immediate gap fill: when the BCD channel has been completely
+            // silent for ≥ FillGapSeconds AND we are ≥ 3 positions behind, fill now
+            // rather than waiting for the next BCD pulse to trigger the fill in OnPulse.
+            int drift = tickBit - _bitIndex;
+            if (drift >= 3 && _bitIndex < 59)
             {
-                double elapsed = (DateTime.UtcNow - _anchorWallTime).TotalSeconds;
-                int expectedBit = (int)Math.Round(elapsed);
-                int drift = expectedBit - _bitIndex;
-
-                if (Math.Abs(drift) > 2)
-                    _onLog?.Invoke($"Tick alignment drift: bitIndex={_bitIndex}, tick-derived={expectedBit} ({drift:+0;-0} positions)");
-
-                if (drift >= 3 && _bitIndex < 59)
+                double gapFrom100Hz = _lastNonTickPulseTick != 0
+                    ? TicksToSeconds(tickNow - _lastNonTickPulseTick)
+                    : double.MaxValue;
+                if (gapFrom100Hz >= FillGapSeconds)
                 {
-                    int fillTo = Math.Min(expectedBit, 59); // leave pos 59 for the frame-end pulse
+                    int fillTo = Math.Min(tickBit, 59); // leave pos 59 for the frame-end pulse
                     _onLog?.Invoke($"Tick gap fill: [{_bitIndex:D2}]→[{fillTo:D2}] ({fillTo - _bitIndex} bits)");
                     while (_bitIndex < fillTo)
                     {
@@ -576,16 +680,23 @@ public class FrameDecoder
                         _bitGapFilled[_bitIndex] = true;
                         _bitIndex++;
                     }
-                    _lastNonTickPulseTime = DateTime.UtcNow; // reset gap timer so next 100 Hz pulse gap is measured from here
-                    _lastPulseWasSynthetic = true;           // next real pulse must not be suppressed as a double-trigger
+                    _lastNonTickPulseTick = tickNow;
+                    _lastPulseWasSynthetic = true;
                     PublishFrameVisualization();
+                    // Pending bit index now consumed by the fill; clear it so OnPulse
+                    // doesn't try to fill again when the next BCD pulse arrives at fillTo.
+                    _tickPendingBitIndex = -1;
+                }
+                else if (Math.Abs(drift) > 2)
+                {
+                    _onLog?.Invoke($"Tick: bitIndex={_bitIndex}, tick-derived={tickBit} ({drift:+0;-0} positions)");
                 }
             }
             return;
         }
 
-        // MinutePulse — direct P0 anchor
-        var now = DateTime.UtcNow;
+        // MinutePulse — direct P0 anchor (Stopwatch for monotonic timing).
+        long now = _getTimestamp();
 
         // Edge case: 100 Hz P0 Marker arrived first in the same audio block
         // (PulseDetector runs before TickDetector in DecoderPipeline.ProcessSamples).
@@ -635,22 +746,22 @@ public class FrameDecoder
         _frameHits = 1;
         _frameTotal = 1;
         _lastStoredPulseType = PulseType.Marker;
-        _candidateAnchorTime = DateTime.MinValue;
-        _anchorWallTime = now; // minute pulse fires at P0 — record exact anchor time
+        _candidateAnchorTick = 0;
+        _anchorWallTick = now; // minute pulse fires at P0 — record exact anchor time
 
         // Reset the inter-pulse gap timer to P0 so the gap-fill algorithm measures gaps
         // relative to this anchor, not to the last 100 Hz pulse from the previous minute.
         // Without this reset, a signal fade spanning the minute boundary (e.g., last 100 Hz
         // pulse 3 s before the minute) inflates the apparent gap for bit [01] to 3 s and
         // causes gap-fill to over-insert 2 positions, creating a persistent 3-position
-        // frame offset. The 100 Hz P0 Marker (absorbed by _skip100HzP0Until below) will
-        // update _lastNonTickPulseTime again when it fires ~800 ms from now — which is
+        // frame offset. The 100 Hz P0 Marker (absorbed by _skip100HzP0UntilTick below) will
+        // update _lastNonTickPulseTick again when it fires ~800 ms from now — which is
         // fine because the gap for bit [01] then becomes only 0.2 s (no fill needed).
-        _lastNonTickPulseTime = now;
+        _lastNonTickPulseTick = now;
 
         // The concurrent 100 Hz P0 Marker arrives up to ~20 ms later. Set the absorb
         // window so it is treated as P0 confirmation, not stored as bit 1.
-        _skip100HzP0Until = now.AddMilliseconds(100);
+        _skip100HzP0UntilTick = now + SecondsToTicks(0.1);
 
         // Clear the saturation gate — the minute pulse is definitive evidence that the
         // signal is present and the 1000 Hz channel is above noise. Any stale Marker-rate
@@ -831,18 +942,30 @@ public class FrameDecoder
                        $"(>0.5 solid, <0.1 marginal)");
         }
 
+        // BCD-constrained post-processing: verify each BCD digit group is in its valid range
+        // and correct single-bit overflows by clearing the highest-weight contributing bit.
+        // This catches cases where a marginal high-weight vote flips a digit from 5→6 (minutes
+        // tens), 2→3 (hours tens), or 9→10+ (any units group) — invalid BCD that BcdDecoder
+        // would reject outright, but recoverable with one bit correction.
+        int bcdCorrections = ApplyBcdConstraints(votedBits);
+        if (bcdCorrections > 0)
+            _onLog?.Invoke($"BCD constraints: {bcdCorrections} bit(s) corrected");
+
         var frame = BcdDecoder.Decode(votedBits);
         _bitIndex = 0;
 
         // Date hint validation: if a known UTC date is set, reject any frame whose
-        // decoded date falls more than 7 days away. BCD range checks cannot catch a
+        // decoded date falls more than 14 days away. BCD range checks cannot catch a
         // wrong-but-in-range year (e.g. 74 instead of 26) — only a plausibility gate
-        // against an external reference can. 7 days is generous enough to survive across
-        // a week of no successful decodes while still blocking obviously wrong years.
+        // against an external reference can.
+        // Widened 7 → 14 days: on weak HF signals the slow-field bits (DOY) are frequently
+        // erased. Even with the persistent store weight raised, a cluster of low-confidence
+        // live votes can push DOY off by 7–10 days, causing valid-time frames to be rejected.
+        // 14 days still blocks clearly-wrong years while surviving marginal DOY errors.
         if (frame != null && _knownDateUtc.HasValue)
         {
             double dayDiff = Math.Abs((frame.UtcTime.Date - _knownDateUtc.Value).TotalDays);
-            if (dayDiff > 7.0)
+            if (dayDiff > 14.0)
             {
                 _onLog?.Invoke($"Date mismatch: decoded {frame.UtcTime:yyyy-MM-dd} " +
                                $"is {dayDiff:F0} days from expected {_knownDateUtc.Value:yyyy-MM-dd} — frame rejected");
@@ -909,8 +1032,8 @@ public class FrameDecoder
         // Advance anchor by 60 s so tick-alignment checks stay accurate in the next frame.
         // The minute-pulse handler overwrites this with the exact P0 wall-clock time whenever
         // a MinutePulse arrives, keeping long-term accuracy without accumulated drift.
-        if (_anchorWallTime != DateTime.MinValue && _state != State.Searching)
-            _anchorWallTime = _anchorWallTime.AddSeconds(60);
+        if (_anchorWallTick != 0 && _state != State.Searching)
+            _anchorWallTick += SecondsToTicks(60);
 
         ReportStatus(signalPercent);
     }
@@ -927,20 +1050,46 @@ public class FrameDecoder
     /// </summary>
     public void CheckSignalTimeout()
     {
-        var now = DateTime.UtcNow;
-        if (_lastPulseTime != DateTime.MinValue && (now - _lastPulseTime).TotalSeconds > 2.0)
+        long now = _getTimestamp();
+        if (_lastPulseTick != 0 && TicksToSeconds(now - _lastPulseTick) > 2.0)
         {
-            _lastPulseTime = DateTime.MinValue;
+            _lastPulseTick = 0;
             ReportStatus(0);
         }
 
-        if (_signalTooFaded && _lastNonTickPulseTime != DateTime.MinValue
-            && (now - _lastNonTickPulseTime).TotalSeconds > 20.0)
+        if (_signalTooFaded && _lastNonTickPulseTick != 0
+            && TicksToSeconds(now - _lastNonTickPulseTick) > 20.0)
         {
             _recentMarkerFlags.Clear();
             _signalTooFaded = false;
-            _candidateAnchorTime = DateTime.MinValue;
+            _candidateAnchorTick = 0;
             _onLog?.Invoke("Signal absent >20s — saturation gate reset, resuming anchor search");
+        }
+
+        // Receiver mode check: periodically evaluate whether audio is present but the
+        // 100 Hz subcarrier is absent — the signature of SSB or CW mode rather than AM.
+        // WWV requires AM reception; SSB strips the carrier so nothing will ever decode.
+        _receiverModeCheckCount++;
+        bool audioPresent    = _lastSignalPercent >= AudioPresentThreshold;
+        bool subcarrierAbsent = _subcarrierPercent < SubcarrierAbsentThreshold;
+        if (audioPresent && subcarrierAbsent)
+            _subcarrierAbsentCount++;
+
+        if (_receiverModeCheckCount >= ReceiverModeCheckInterval)
+        {
+            double absentFraction = (double)_subcarrierAbsentCount / _receiverModeCheckCount;
+            if (absentFraction >= 0.80 && !_receiverModeWarned)
+            {
+                _receiverModeWarned = true;
+                _onLog?.Invoke("[WARNING] Audio signal present but 100 Hz subcarrier absent (>80% of last 10 s). " +
+                               "Check that the receiver is in AM mode, not SSB/CW.");
+            }
+            else if (absentFraction < 0.20 && _receiverModeWarned)
+            {
+                _receiverModeWarned = false; // subcarrier has returned — clear warning
+            }
+            _receiverModeCheckCount = 0;
+            _subcarrierAbsentCount  = 0;
         }
     }
 
@@ -1067,8 +1216,8 @@ public class FrameDecoder
         _clockExpected = null;
         _clockVerifiedCount = 0;
         // Clear the P0 candidate and tick absorb window.
-        _candidateAnchorTime = DateTime.MinValue;
-        _skip100HzP0Until = DateTime.MinValue;
+        _candidateAnchorTick = 0;
+        _skip100HzP0UntilTick = 0;
         _lastPulseWasSynthetic = false;
         // Keep _signalTooFaded and _recentMarkerFlags: they reflect signal quality,
         // not frame state, and should persist across individual frame resets.
@@ -1236,9 +1385,14 @@ public class FrameDecoder
             }
 
             // Tier 2: no confident weight anywhere — try persistent store.
+            // Weight raised 0.3 → 0.5: on weak HF signals most slow-field bits (DOY,
+            // year) are erased every frame, so a single low-confidence live vote (weight
+            // ~0.05) was enough to override the persistent store and produce wrong DOY.
+            // At 0.5 the store dominates all live votes below confidence 0.5, which is
+            // the correct behaviour when the field is known-good from a prior decode.
             if (wZero == 0 && wOne == 0 && wMarker == 0 && _persistentBits[i] >= 0)
             {
-                const double persistWeight = 0.3; // lower than any real confident reading
+                const double persistWeight = 0.5; // raised from 0.3
                 switch (_persistentBits[i])
                 {
                     case 0: wZero   = persistWeight; break;
@@ -1290,4 +1444,59 @@ public class FrameDecoder
         if (minMargin == double.MaxValue) minMargin = 1.0; // no contested bits
         return (voted, persistFallbacks, structFallbacks, minMargin, minMarginPos);
     }
+
+    /// <summary>
+    /// Clamps each BCD digit group in the voted bit array to its valid decimal range.
+    /// WWV BCD values are multi-digit decimal numbers where each decimal digit must be 0–9
+    /// (and some groups have tighter limits: minutes tens 0–5, hours tens 0–2, etc.).
+    /// A single high-weight bit error can push a digit out of range — this method corrects
+    /// such errors by clearing the highest-weight set bit that causes the overflow.
+    /// Returns the number of bits corrected.
+    /// </summary>
+    private static int ApplyBcdConstraints(int[] bits)
+    {
+        int corrections = 0;
+
+        // Each entry: (positions[], weights[], maxValue)
+        // maxValue is the maximum valid SUM from that group's bits.
+        (int[] positions, int[] weights, int max)[] groups =
+        [
+            ([1,  2,  3,  4 ], [1,  2,  4, 8 ],  9),  // minutes units  0–9
+            ([6,  7,  8      ], [10, 20, 40    ], 50),  // minutes tens   0–50 (digit 0–5)
+            ([12, 13, 14, 15], [1,  2,  4, 8 ],  9),  // hours units    0–9
+            ([17, 18         ], [10, 20        ], 20),  // hours tens     0–20 (digit 0–2)
+            ([22, 23, 24, 25], [1,  2,  4, 8 ],  9),  // DOY units      0–9
+            ([27, 28, 30, 31], [10, 20, 40, 80], 90),  // DOY tens       0–90 (digit 0–9)
+            ([45, 46, 47, 48], [1,  2,  4, 8 ],  9),  // year units     0–9
+            ([50, 51, 52, 53], [10, 20, 40, 80], 90),  // year tens      0–90 (digit 0–9)
+        ];
+
+        foreach (var (positions, weights, max) in groups)
+        {
+            int value = 0;
+            for (int i = 0; i < positions.Length; i++)
+                if (bits[positions[i]] == 1) value += weights[i];
+
+            if (value <= max) continue;
+
+            // Clear the highest-weight set bit(s) until the digit is within range.
+            for (int i = positions.Length - 1; i >= 0 && value > max; i--)
+            {
+                if (bits[positions[i]] == 1)
+                {
+                    bits[positions[i]] = 0;
+                    value -= weights[i];
+                    corrections++;
+                }
+            }
+        }
+
+        return corrections;
+    }
+
+    private static double TicksToSeconds(long ticks) =>
+        (double)ticks / Stopwatch.Frequency;
+
+    private static long SecondsToTicks(double seconds) =>
+        (long)(seconds * Stopwatch.Frequency);
 }
