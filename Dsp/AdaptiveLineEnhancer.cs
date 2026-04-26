@@ -45,6 +45,21 @@ public class AdaptiveLineEnhancer
         _buf     = new double[_bufLen];
     }
 
+    /// <summary>
+    /// L2 norm of the adaptive filter weights. Starts at 0 and grows as the filter
+    /// converges toward the periodic carrier. A stable, non-zero value means the ALE
+    /// has found a predictable signal; near-zero means it has not yet converged.
+    /// </summary>
+    public double WeightNorm
+    {
+        get
+        {
+            double sum = 0;
+            foreach (double w in _weights) sum += w * w;
+            return Math.Sqrt(sum);
+        }
+    }
+
     public void Reset()
     {
         Array.Clear(_weights, 0, _weights.Length);

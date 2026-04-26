@@ -16,10 +16,13 @@ Built with WPF (.NET 9) and the MVVM pattern. Dark-themed UI with real-time sign
 
 - **Real-time BCD time-code decoding** from the 100 Hz audio subcarrier used by WWV-family stations
 - **1000 Hz tick detector** — detects the WWV second ticks and the 800 ms minute pulse on the separate 1000 Hz audio channel; minute pulse directly anchors P0 without waiting for a 9-second inter-marker gap
-- **Coherent synchronous (lock-in) detector** — demodulates the 100 Hz subcarrier with a narrow IQ lowpass, giving 15–25 dB better SNR than a simple bandpass + rectifier
-- **Costas-loop carrier PLL** — tracks and corrects SDR local-oscillator frequency error of up to ±10 Hz, then narrows the detector bandwidth for maximum SNR once locked
-- **Matched-filter pulse classification** — classifies pulses by counting genuinely-LOW samples rather than edge timing, removing systematic bias from the envelope's rise/fall time
-- **Erasure-aware multi-frame accumulation** — majority-votes three consecutive 60-bit frames, but only counts bits where both classifiers agreed and the bit was actually received (not gap-filled during a fade); fades produce erasures rather than wrong votes
+- **Adaptive Line Enhancer (ALE)** — NLMS predictor placed before the synchronous detector; extracts the periodic 100 Hz subcarrier from broadband noise, providing ~6–10 dB additional noise suppression before coherent demodulation
+- **Coherent synchronous (lock-in) detector** — demodulates the 100 Hz subcarrier with a narrow IQ lowpass (2 Hz nominal, widening to 8 Hz during HF fading), giving 15–25 dB better SNR than a simple bandpass + rectifier
+- **Matched-filter pulse classification** — classifies pulses by counting genuinely-LOW samples rather than edge timing, removing systematic bias from the envelope's rise/fall time; classification reference uses a 75th-percentile carrier estimate (fade-resistant) rather than the real-time IIR tracker
+- **Percentile carrier reference** — tracks the 75th percentile of the last 30 inter-pulse HIGH-period peaks; multipath constructive spikes and HF-fade-depressed HIGH periods are outliers in this window and do not distort the classification threshold
+- **Ionospheric fade detection** — `IsFading` flag correctly triggers when the envelope drops below 15% of the stable carrier reference for > 200 ms; fade-corrupted pulses receive zero confidence weight so they cannot corrupt the per-bit accumulator
+- **Per-bit accumulation voting** (NTP driver 36 §3.2) — each of the 60 bit positions carries a signed evidence score (positive = One, negative = Zero) updated with an exponential moving average each minute; confident measurements push the score toward ±1; erasures apply a slow 0.90 decay so clean-frame evidence persists through several faded minutes; the vote threshold is ±0.15, below which the persistent store or structure default wins
+- **Three-point bipolar discriminator** (NTP driver 36 §5) — after each 1000 Hz second tick the 100 Hz envelope is sampled at ~350 ms and ~650 ms after the tick; HIGH at 350 ms → Zero; LOW then HIGH at 650 ms → One; both LOW → erasure; this classifies bits from the carrier's return timing without relying on threshold crossings, which fail during HF fades that extend past the LOW period
 - **Persistent slow-bit carry-over** — day-of-year, year, DUT1, DST, and leap-second positions (27 out of 60) are retained from the last successfully validated frame and used to fill those positions in subsequent partial frames, since they change at most once per day; only minutes and hours (which change every minute) require fresh collection each frame
 - **Operator UTC date hint** — the operator can enter today's UTC date (yyyy-MM-dd) before or during listening; the decoder immediately pre-fills the 18 DOY and year bit positions, reducing the number of bits that must be received from 60 to ~13 under poor propagation; the hint is overwritten automatically by the first successful frame decode
 - **P0→P1 gap confirmation** — when only the 100 Hz channel is available, validates the unique 9-second gap between P0 and P1 before anchoring, preventing the reset loop caused by marker-length noise during deep fades
@@ -181,6 +184,14 @@ The strength of the **100 Hz subcarrier specifically**, after the filters that i
 - **Low both** — weak or no signal. Try a different frequency, check antenna, or adjust receiver volume
 - **100 Hz Level reads but won't lock** — signal is present but fading or noisy; let it run longer or try a stronger frequency
 
+#### Sync Score
+A 0–100% quality indicator for the 100 Hz subcarrier derived from two sub-scores:
+
+- **Carrier score (65% weight):** Goertzel spectral analysis of the ALE-enhanced audio across a 500 ms window, measuring how prominently the 100 Hz tone stands above its spectral neighbors. High values indicate a clean, strong subcarrier.
+- **Cadence score (35% weight):** how regularly the 100 Hz pulses arrive at approximately 1-second intervals. Degrades when ionospheric fading causes missed or overflowed pulses.
+
+Typical values under real HF propagation are 30–70%. Values consistently above 60% indicate a strong, stable signal with good propagation. The status log reports the score every 5 seconds as `sync=N% @100.0 Hz`.
+
 #### 100 Hz Lock
 Shows how well the decoder is aligned to the station's frame structure. Rises as valid position markers are confirmed and falls when frames fail to validate.
 
@@ -260,21 +271,22 @@ Audio In (22,050 Hz, 16-bit mono, 50 ms blocks)
     ├─────────────────────────────────────────────┐
     │  100 Hz BCD channel                         │  1000 Hz tone channel
     ▼                                             ▼
-[5] Synchronous (Lock-In) Detector            [8] Tick Detector
-    │  IQ demodulation at 100 Hz                  │  IQ demodulation at 1000 Hz
-    │  Lowpass: 8 Hz (acquisition)                │  Lowpass: 150 Hz (resolves 5 ms tick)
-    │  → 2 Hz after PLL lock                      │  Adaptive level: 2 ms attack / 3 s decay
-    │  Envelope = 2·√(I²+Q²)                      │  Classifies:
-    │  SNR improvement: 15–25 dB                  │    ≤50 ms  → SecondTick (5 ms tick)
-    │                                             │    ≥500 ms → MinutePulse (P0 anchor)
-    ▼                                             │
-[6] Carrier PLL (Costas Loop)                    │
-    │  Corrects SDR LO error ±10 Hz              │
-    │  Narrows lowpass 8→5 Hz on lock            │
+[5] Adaptive Line Enhancer (ALE)             [8] Tick Detector
+    │  NLMS, delay=5, 128 taps, μ=0.3             │  IQ demodulation at 1000 Hz
+    │  Extracts periodic 100 Hz component         │  Lowpass: 150 Hz (resolves 5 ms tick)
+    │  Suppresses broadband noise by ~6–10 dB     │  Adaptive level: 2 ms attack / 3 s decay
+    │                                             │  Classifies:
+    ▼                                             │    ≤50 ms  → SecondTick (5 ms tick)
+[6] Synchronous (Lock-In) Detector               │    ≥500 ms → MinutePulse (P0 anchor)
+    │  IQ demodulation at 100 Hz                  │
+    │  Lowpass: 2 Hz (nominal, stable signal)      │
+    │  → 8 Hz when HF fading detected (adaptive)  │
+    │  Envelope = 2·√(I²+Q²)                      │
+    │  SNR improvement: 15–25 dB                  │
     │                                             │
     ▼                                             │
 [7] Pulse Detector                               │
-    │  Hysteretic: enter 47% HIGH, exit 62% HIGH  │
+    │  Hysteretic: enter 55% HIGH, exit 62% HIGH  │
     │  30 ms dropout tolerance                    │
     │  Weak-signal guard: suppress if H < 3×noise │
     │                                             │
@@ -303,13 +315,18 @@ Audio In (22,050 Hz, 16-bit mono, 50 ms blocks)
     │   — Missing expected marker at positions 9, 19, 29, 39, 49 → Searching within 10 s
     │
     ▼
-[10] Erasure-Aware Multi-Frame Accumulator (ring buffer, depth 5 fast / 15 slow)
+[10] Per-Bit Accumulator + Three-Point Bipolar Discriminator
+    │  (NTP driver 36 §3.2 + §5)
     │
-    │  Each stored bit is tagged confident or erased:
-    │    Confident: pulse received, MatchedFilter and duration classifiers agreed
-    │    Erased:    gap-filled estimate, or classifiers disagreed (ambiguous pulse)
+    │  Each bit position carries a signed evidence score [-1.0 .. +1.0]:
+    │    Positive: evidence for One.  Negative: evidence for Zero.
+    │    Updated by 100 Hz pulse measurement each minute (EMA, α ≤ 0.60).
+    │    Updated by 3-point discriminator every second from 1000 Hz ticks.
+    │    Erasures apply ×0.90 decay — clean-frame evidence persists across fades.
+    │    Slow bits (DOY, year, DUT1, DST, leap) with a known persistent-store value
+    │    use α ≤ 0.10 — requires several consistent frames to override the store.
     │
-    │  Three-tier fallback when no confident reading exists for a position:
+    │  Vote threshold |acc| ≥ 0.15; below that, three-tier fallback:
     │    1. Persistent store — value from the last successfully validated frame
     │       (covers 27 slow-changing positions: DOY, year, DUT1, DST, leap)
     │    2. Structure default — known marker positions → Marker, data positions → 0
@@ -354,7 +371,7 @@ The core of the BCD demodulator. Instead of bandpass filtering and rectifying:
 3. A single-pole IIR lowpass filter on each channel removes everything except near-DC content — which, after mixing, is where the 100 Hz signal sits
 4. Envelope = `2·√(I² + Q²)` — the factor of 2 restores amplitude lost in mixing; the magnitude is phase-independent
 
-**Why this is better than bandpass + rectifier:** The lowpass cutoff (8 Hz during acquisition, 5 Hz after PLL lock) integrates over many cycles of the 100 Hz carrier per time constant. A narrower integration window means more noise rejection. The initial improvement over a wide bandpass is 15–25 dB. The synchronous detector also has no DC offset problem from half-wave rectification.
+**Why this is better than bandpass + rectifier:** The lowpass cutoff (2 Hz nominal, widening to 8 Hz during HF fading) integrates over many cycles of the 100 Hz carrier per time constant. A narrower integration window means more noise rejection. The initial improvement over a wide bandpass is 15–25 dB. The synchronous detector also has no DC offset problem from half-wave rectification.
 
 The noise floor is tracked with an asymmetric algorithm: fast exponential decay when the envelope falls below the current floor (quickly finds the true quiet level) and very slow rise otherwise (the carrier amplitude during HIGH periods cannot inflate the floor over 0.8-second Marker pulses).
 
@@ -370,29 +387,32 @@ Pulse classification by duration at exit-threshold crossing:
 - ≥ 500 ms → **MinutePulse** (nominal 800 ms — the P0 minute marker)
 - Other durations are discarded (no valid WWV tone has an intermediate length)
 
-#### Carrier PLL
-SDR receivers have local oscillator errors of 0.5–5 Hz. Even a 4 Hz offset causes visible envelope ripple and degrades pulse boundaries. The Costas-loop PLL corrects this:
+#### Adaptive Lowpass
+The synchronous detector's lowpass defaults to **2 Hz** — a narrow bandwidth that maximizes noise rejection for stable signals. When the pulse detector's `IsAmplitudeUnstable` flag fires (rapid envelope swings indicating HF ionospheric multipath), the lowpass widens to **8 Hz** so the detector can track the faster envelope transitions during fading. It returns to 2 Hz once conditions stabilize.
 
-- **Frequency discriminator:** measures the angular rotation rate of the IQ vector between blocks. `cross = I₀·Q₁ − Q₀·I₁ ≈ A²·sin(Δφ)`, from which the frequency error is `−atan2(cross, dot) / (2π·blockDuration)` in Hz.
-- **PI loop filter:** a proportional term tracks fast transients; an integral term eliminates steady-state offset.
-- **Lock detection:** declared after 5 consecutive blocks with `|freqError| < 0.5 Hz`. On lock, the synchronous detector's lowpass is narrowed from 8 Hz to 2 Hz, improving noise rejection. On loss of lock it widens immediately for re-acquisition.
-- **Gating:** PLL updates are skipped during pulse LOW periods (I ≈ Q ≈ 0) to prevent spurious phase jumps from a near-zero IQ vector.
+No carrier PLL is used. The 100 Hz subcarrier is derived directly from the NIST atomic clock standard and is amplitude-keyed (on/off) — it is not frequency-modulated. The 100 Hz frequency in AM-demodulated baseband audio is exact by definition: the SDR local-oscillator offset shifts the HF carrier but the 100 Hz subcarrier is generated by dividing the station's on-site atomic standard, so it remains at exactly 100 Hz after AM demodulation regardless of receiver tuning error. A frequency-tracking PLL would be solving a problem that does not exist.
 
 #### Pulse Detector
 Converts the amplitude envelope into discrete pulse events by measuring how long the carrier stays below a threshold.
 
-The detector tracks the carrier HIGH level using an asymmetric IIR: fast attack (200 ms time constant) during HIGH periods only, and slow 3-second decay during LOW periods. Gating the attack to HIGH-only periods is important — noise or ticks during a LOW period cannot inflate the HIGH reference and push the exit threshold above the carrier level, which would lock the detector in the "in pulse" state indefinitely.
+`levelHigh` is tracked by two mechanisms with different purposes:
 
-Hysteresis prevents chattering: the detector enters a pulse at 47% of HIGH and exits only when the envelope clears 62% of HIGH for 30 ms (the dropout tolerance). The 15% dead-band spans the ~20 ms envelope rise/fall time of the synchronous detector at 5 Hz lowpass. A safety cap forces any LOW period longer than 1.1 seconds to end, preventing a stuck state if a continuous-low condition (e.g., signal dropout) occurs.
+**Real-time IIR** (100 ms attack, 30 ms fast-recovery attack, 3 s decay): drives the per-sample `enterThreshold` and `exitThreshold`. Attack is gated to HIGH-only periods so noise during a LOW period cannot inflate the reference and lock the detector in the pulse state indefinitely. The fast-recovery branch (30 ms τ) snaps the tracker back after a deep fade where the IIR has decayed to ~69% of the true carrier.
 
-A **weak-signal guard** suppresses all pulse detection while the HIGH level is less than 3× the noise floor, because at that SNR the exit threshold may never be reachable — every pulse would time out at 1.1 s and be classified as a Marker, producing garbage output.
+**75th-percentile of recent inter-pulse peaks**: each time a pulse starts, the peak envelope from the preceding HIGH period is pushed into a 30-entry circular window. The 75th percentile of this window is used as the reference for pulse classification (see Matched Filter below). This separates the two concerns: the IIR reacts fast enough for threshold detection; the percentile provides a stable reference that is resistant to both multipath constructive spikes (brief high outliers) and HF-fade-depressed HIGH periods (low outliers).
+
+Hysteresis prevents chattering: the detector enters a pulse at 55% of the IIR HIGH level and exits only when the envelope clears 62% of HIGH for 30 ms (the dropout tolerance). The 7% dead-band spans the envelope rise/fall time of the synchronous detector. A safety cap forces any LOW period longer than 1.1 seconds to end, preventing a stuck state during signal dropout.
+
+A **weak-signal guard** suppresses all pulse detection while the HIGH level is less than 3× the noise floor.
+
+**Fade detection** (`IsFading` flag): fires when the envelope has been below **15% of the stable carrier reference** for more than 200 ms. The WWV LOW carrier is ~31% of HIGH — well above the 15% threshold — so normal pulse LOW periods never trigger it. Deep HF fades drop the envelope to noise level (<5%), correctly setting `IsFading = true`. Once set, recovery requires 500 ms of continuous signal and the IIR level recovering to ≥ 60% of the running peak envelope. Pulses emitted while `IsFading` carry zero confidence weight and are treated as erasures by the multi-frame accumulator.
 
 #### Matched Filter
 At the end of each detected pulse, the matched filter classifies it by counting how many envelope samples were below the midpoint between HIGH and LOW carrier levels (50% of HIGH). This "energy counting" is equivalent to correlating the envelope against a rectangular template for each pulse type — the optimal classifier in white Gaussian noise.
 
 This eliminates a systematic positive-duration bias: simple threshold-crossing measurement includes the ~20 ms envelope rise and fall times, making a 200 ms Zero pulse appear 40 ms longer than it is. The matched filter counts only samples genuinely in the LOW state, removing this bias. Classification boundaries are: < 50 ms = Tick, 50–350 ms = Zero, 350–650 ms = One, ≥ 650 ms = Marker.
 
-The midpoint threshold uses the `levelHigh` snapshot taken just before the pulse started, not the end-of-pulse value. During an 800 ms Marker's LOW period, the 3-second exponential decay would reduce `levelHigh` to 76% of its true value, dropping the midpoint to 38% — dangerously close to the actual LOW carrier level at 31%. The pre-pulse snapshot keeps a clean reference throughout.
+The midpoint threshold uses the **percentile-based carrier reference** captured at pulse start, not the real-time IIR value. This solves two problems simultaneously: (1) the IIR decays during an 800 ms Marker's LOW period to ~76% of the true carrier, which would drop the midpoint threshold to 38% — dangerously close to the actual LOW carrier level at 31%; (2) multipath constructive interference spikes can inflate the IIR before a pulse, raising the midpoint above the LOW carrier so the matched filter counts zero genuine-LOW samples and misclassifies everything as a Tick. The percentile reference is immune to both: spikes are high outliers in the 30-entry window and do not shift the 75th percentile; HF-faded HIGH periods are low outliers and also do not shift it.
 
 ---
 
@@ -426,21 +446,45 @@ This prevents the reset loop caused by marker-length noise during deep fades (wh
 #### Marker Saturation Gate
 During deep ionospheric fades the 100 Hz carrier can drop for ~0.8 s during what should be 0.2 s Zero or 0.5 s One periods, causing almost all pulses to be classified as Markers. Normal WWV has 7/60 = 11.7% Markers. When more than 60% of the last 20 pulses are Markers, the gate pauses all anchor attempts — log activity stops, no more "bad gap" spam. The gate recovers below 25% Marker rate (hysteresis to prevent rapid oscillation). If signal has been entirely absent for more than 20 seconds, the gate resets immediately — the propagation window has changed and stale measurements should not block a fresh start.
 
-#### Erasure-Aware Multi-Frame Accumulation
-A ring buffer holds the 5 most recent raw 60-bit frames (15 frames for slowly-changing fields: DOY, year, DUT1, DST, leap). Each bit position is tagged **confident** or **erased**:
+#### Per-Bit Accumulator Voting
+Each of the 60 bit positions carries a signed evidence score in the range [−1.0, +1.0]. A positive score is evidence for One; negative is evidence for Zero. This replaces the earlier ring-buffer majority voter.
 
-- **Confident:** the bit was received from an actual pulse and both the MatchedFilter and duration classifiers agreed on its type
-- **Erased:** the position was gap-filled during a fade, or the two classifiers disagreed (ambiguous pulse)
+Each minute, after a frame is assembled, every confident bit (both classifiers agreed, not fade-zeroed) updates its accumulator position via an exponential moving average:
 
-Before BCD decode, a majority vote is computed using only confident bits. This is the key insight from Mills' NTP driver 36: *fades produce erasures, not wrong votes*. A gap-filled Zero estimate must not outvote a genuine One from two prior clean frames.
+```
+acc[i] += α × (target − acc[i])
+```
 
-When no confident reading exists for a position, a three-tier fallback applies in order:
+where `target` is +1 for a One measurement and −1 for a Zero measurement. The alpha cap is:
+- **α ≤ 0.10** for slow-changing bit positions (DOY, year, DUT1, DST, leap) that have a known value in the persistent store — a single confident-wrong measurement moves the score by at most 0.09, staying below the 0.15 vote threshold so the persistent store remains authoritative until several frames consistently disagree.
+- **α ≤ 0.60** for all other positions (hours, minutes) — reacts faster to genuine signal.
 
-1. **Persistent slow-bit store** — 27 positions covering day-of-year, year, DUT1, DST, and leap-second warning are retained from the last successfully BCD-validated frame. Since the day changes at most once every 24 hours and the year once per year, these values are almost always correct on subsequent frames. Minutes and hours are deliberately excluded — they change every minute and stale values would corrupt the decode. The operator UTC date hint (see [UTC Date Hint](#utc-date-hint-optional)) seeds this store at startup before any frame has been decoded, which is especially valuable during the initial lock-on period under weak signals.
+Erased positions (gap-filled, classifiers disagreed, tick-fade-zeroed) apply a slow **×0.90 decay** each minute instead of a targeted update. Clean-frame evidence at ±0.5 survives approximately 6 consecutive faded minutes before falling below the 0.15 vote threshold.
 
-2. **Structure-aware default** — if the persistent store has no prior value (cold start) or the position is not a slow-changing field, known WWV structure is used: expected marker positions (0, 9, 19, 29, 39, 49, 59) default to Marker; all other positions default to 0. This prevents a single noise artifact stored as an erased value from winning a vote with 1 unconfident count against 0 confident counts for the structurally correct value.
+This is the key insight from Mills' NTP driver 36: *ionospheric fades produce erasures, not wrong votes.* A gap-filled estimate carries no directional evidence and decays passively; it cannot flip an accumulator position that was pushed by a prior clean frame.
 
-The frame log shows erased positions as lowercase letters (`m`, `0`, `1`) and a `hits=N/M` count per frame where N is confidently-classified pulses and M is total pulses. History is cleared on anchor transitions (minute pulse or P0→P1 confirmation), not on individual frame decode failures, so accumulated frames continue improving the vote across back-to-back weak frames.
+The vote rule: if `|acc[i]| ≥ 0.15`, the sign determines the voted bit. Otherwise the three-tier fallback applies:
+
+1. **Persistent slow-bit store** — 27 positions covering day-of-year, year, DUT1, DST, and leap-second warning are retained from the last successfully BCD-validated frame. Since the day changes at most once every 24 hours and the year once per year, these values are almost always correct on subsequent frames. Minutes and hours are deliberately excluded — they change every minute and stale values would corrupt the decode. The operator UTC date hint (see [UTC Date Hint](#utc-date-hint-optional)) seeds this store at startup and also pre-seeds the accumulator to ±0.4, so the hint is immediately authoritative even before the first frame decode.
+
+2. **Structure-aware default** — if the persistent store has no value (cold start) or the position is not a slow-changing field, known WWV structure is used: expected marker positions (0, 9, 19, 29, 39, 49, 59) default to Marker; all other positions default to 0.
+
+The accumulator **persists across re-anchors** (it is not cleared on P0 detection) so evidence from prior clean frames survives minute-boundary fades that force a re-anchor. It is only cleared by a full user-initiated decoder reset.
+
+#### Three-Point Bipolar Discriminator
+After each 1000 Hz second tick at position N, the 100 Hz envelope is sampled at two offsets independently of the PulseDetector's threshold-crossing measurement:
+
+- **Sample A @ ~350 ms** — between the Zero (200 ms) and One (500 ms) LOW-period ends
+- **Sample B @ ~650 ms** — between the One (500 ms) and Marker (800 ms) LOW-period ends
+
+Classification using the tracked carrier level as a 50% threshold:
+- A **HIGH** → **Zero** (carrier returned within 200 ms)
+- A low, B **HIGH** → **One** (carrier returned between 350–650 ms)
+- Both low → erasure (Marker, or carrier still absent — deep fade)
+
+This provides a second independent measurement that directly updates the accumulator with `α = 0.50`. It is especially valuable during partial fades that extend past the Zero LOW period but not the One LOW period — conditions where the threshold-crossing detector would misclassify the bit, but the discriminator correctly identifies it. It does not help during full broadband fades where both channels are dark simultaneously, but those frames generate erasures rather than wrong votes regardless.
+
+The frame log shows erased positions as lowercase letters (`m`, `0`, `1`) and a `hits=N/M` count per frame where N is confidently-classified pulses and M is total pulses.
 
 #### Frame Integrity Checks
 Two structural invariants are checked after each bit is stored, bailing early rather than collecting 60 bits and failing at decode time:
@@ -468,7 +512,11 @@ When the signal drops for 2–30 seconds (the cadence guard detects the inter-pu
 
 ### Adaptive Line Enhancer (ALE)
 
-An `AdaptiveLineEnhancer` using Normalized Least Mean Squares (NLMS) is also present in the DSP library. It extracts periodic signals (such as the 100 Hz subcarrier) from broadband noise by exploiting temporal correlation: a delayed copy of the input predicts the current sample via an adaptive FIR filter. For a periodic signal the delayed version is highly correlated; for broadband noise it is not, so the filter output converges to the periodic component. The NLMS normalization makes step size independent of input level.
+The `AdaptiveLineEnhancer` sits between the notch filters and the synchronous detector in the 100 Hz channel (step [5] in the pipeline). It uses Normalized Least Mean Squares (NLMS) with a delay of 5 samples, 128 filter taps, and step size μ = 0.3.
+
+It extracts the periodic 100 Hz subcarrier from broadband noise by exploiting temporal correlation: a delayed copy of the input predicts the current sample via an adaptive FIR filter. For a periodic signal the delayed copy is highly correlated with the current sample — the filter converges to reconstruct it. For broadband noise the delayed copy is uncorrelated, so the filter output approaches zero for noise. The NLMS normalization makes the effective step size independent of input level.
+
+In practice this provides roughly 6–10 dB of noise suppression in the 100 Hz path before the synchronous detector processes it. This improves pulse boundary clarity, especially on marginal HF signals. The ALE can be disabled from the settings panel for A/B comparison.
 
 ---
 
@@ -490,7 +538,7 @@ RadioTime Decoder/
 │   ├── HighpassFilter.cs           # 2nd-order Butterworth highpass, 20 Hz cutoff
 │   ├── NotchFilter.cs              # IIR biquad notch (60 Hz and 120 Hz instances)
 │   ├── SynchronousDetector.cs      # Coherent IQ lock-in detector for 100 Hz subcarrier
-│   ├── CarrierPll.cs               # Costas-loop PLL, cross-product discriminator, PI filter
+│   ├── CarrierPll.cs               # Costas-loop PLL (not in active pipeline — 100 Hz is not frequency-modulated)
 │   ├── PulseDetector.cs            # Hysteretic pulse detection with gated HIGH tracking
 │   ├── MatchedFilter.cs            # Energy-counting matched filter for pulse classification
 │   ├── TickDetector.cs             # 1000 Hz IQ demodulator; second ticks and minute pulse

@@ -71,6 +71,14 @@ public class CarrierPll
     /// <summary>Current frequency offset being applied to the SynchronousDetector (Hz).</summary>
     public double FrequencyErrorHz => _detector.FrequencyOffsetHz;
 
+    /// <summary>
+    /// PI loop integrator value (Hz). Represents the estimated DC frequency offset of
+    /// the SDR local oscillator from the true 100 Hz carrier. Converges to the steady-
+    /// state LO error after lock; proportional transients average out over time.
+    /// Useful for characterising receiver frequency stability across sessions.
+    /// </summary>
+    public double Integrator => _integrator;
+
     public CarrierPll(SynchronousDetector detector, int sampleRate,
                       double kp = 0.5, double ki = 0.05,
                       double wideLpHz = 8.0, double narrowLpHz = 2.0, double mediumLpHz = 4.0,

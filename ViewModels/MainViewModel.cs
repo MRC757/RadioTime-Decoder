@@ -96,6 +96,7 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     private readonly DecoderPipeline _pipeline;
     private readonly SystemTimeSetter _timeSetter = new();
     private readonly FileLogger _fileLogger = new();
+    private readonly DiagnosticLogger _diagLogger = new();
 
     private bool _isListening;
     private string _knownDateText = DateTime.UtcNow.ToString("yyyy-MM-dd");
@@ -122,12 +123,23 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     private bool _autoSyncMinuteStart;
     private string _lastMinuteSyncInfo = "";
     private bool _enableInputAgc = true;
-    private bool _enableAle = true;
     private bool _enableAdaptiveLowpass = true;
     private double _inputTrimDb;
     private double _syncScore;
     private string _coarseCarrierDisplay = "100.0 Hz";
     private string _agcGainDisplay = "0.0 dB";
+
+    // 1 kHz tick indicator
+    private TickLockState _tickLockState = TickLockState.NoSignal;
+    private double _tickDotOpacity = 0.35;
+    private readonly System.Windows.Threading.DispatcherTimer _tickDimTimer;
+
+    // Minute tone indicator
+    private double _minuteDotOpacity = 0.35;
+    private readonly System.Windows.Threading.DispatcherTimer _minuteDimTimer;
+
+    // Receiver mode alert
+    private string? _receiverModeAlert;
 
     /// <summary>
     /// When true, the system clock's seconds field is zeroed automatically each time
@@ -148,16 +160,22 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         private set { _lastMinuteSyncInfo = value; OnPropertyChanged(); }
     }
 
+    /// <summary>Non-null when the receiver appears to be in the wrong demodulation mode.</summary>
+    public string? ReceiverModeAlert
+    {
+        get => _receiverModeAlert;
+        private set
+        {
+            if (_receiverModeAlert == value) return;
+            _receiverModeAlert = value;
+            OnPropertyChanged();
+        }
+    }
+
     public bool EnableInputAgc
     {
         get => _enableInputAgc;
         set { _enableInputAgc = value; OnPropertyChanged(); }
-    }
-
-    public bool EnableAle
-    {
-        get => _enableAle;
-        set { _enableAle = value; OnPropertyChanged(); }
     }
 
     public bool EnableAdaptiveLowpass
@@ -206,11 +224,95 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         private set { _agcGainDisplay = value; OnPropertyChanged(); }
     }
 
+    // ── 1 kHz tick indicator ─────────────────────────────────────────────────
+
+    /// <summary>Label shown next to the tick dot: "No Signal", "Searching", or "Locked".</summary>
+    public string TickLockText => _tickLockState switch
+    {
+        TickLockState.Locked    => "Locked",
+        TickLockState.Searching => "Searching",
+        _                       => "No Signal",
+    };
+
+    /// <summary>Color of the tick dot and label, reflecting lock state.</summary>
+    public string TickDotColor => _tickLockState switch
+    {
+        TickLockState.Locked    => "#A6E3A1",   // green
+        TickLockState.Searching => "#F9E2AF",   // yellow
+        _                       => "#585B70",   // muted gray
+    };
+
+    /// <summary>
+    /// Opacity of the tick dot. Jumps to 1.0 on each incoming tick and
+    /// decays back to 0.35 after 400 ms — producing a visible flash.
+    /// </summary>
+    public double TickDotOpacity
+    {
+        get => _tickDotOpacity;
+        private set { _tickDotOpacity = value; OnPropertyChanged(); }
+    }
+
+    /// <summary>
+    /// Opacity of the minute-pulse dot. Flashes to 1.0 when the 1 kHz
+    /// minute tone is detected and dims back after 1.5 s.
+    /// </summary>
+    public double MinuteDotOpacity
+    {
+        get => _minuteDotOpacity;
+        private set { _minuteDotOpacity = value; OnPropertyChanged(); }
+    }
+
     public MainViewModel()
     {
         _pipeline = new DecoderPipeline(OnSignalUpdate, OnFrameDecoded, msg => Log(msg), OnFrameUpdate,
-            getSettings: GetDecoderSettings);
+            getSettings: GetDecoderSettings,
+            diagnosticLogger: _diagLogger);
         _pipeline.MinutePulseDetected += OnMinutePulseDetected;
+
+        // Flash the tick dot for 400 ms on each incoming second tick.
+        _tickDimTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(400)
+        };
+        _tickDimTimer.Tick += (_, _) =>
+        {
+            _tickDimTimer.Stop();
+            TickDotOpacity = 0.35;
+        };
+
+        _pipeline.TickHeartbeat += state =>
+        {
+            Application.Current?.Dispatcher.InvokeAsync(() =>
+            {
+                _tickLockState = state;
+                TickDotOpacity = 1.0;
+                OnPropertyChanged(nameof(TickLockText));
+                OnPropertyChanged(nameof(TickDotColor));
+                _tickDimTimer.Stop();
+                _tickDimTimer.Start();
+            });
+        };
+
+        // Flash the minute dot for 1.5 s on each detected WWV/WWVH minute tone.
+        _minuteDimTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(1500)
+        };
+        _minuteDimTimer.Tick += (_, _) =>
+        {
+            _minuteDimTimer.Stop();
+            MinuteDotOpacity = 0.35;
+        };
+
+        _pipeline.MinutePulseDetected += _ =>
+        {
+            Application.Current?.Dispatcher.InvokeAsync(() =>
+            {
+                MinuteDotOpacity = 1.0;
+                _minuteDimTimer.Stop();
+                _minuteDimTimer.Start();
+            });
+        };
         LoadDevices();
         LoadStations();
 
@@ -639,6 +741,16 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
                 CountdownDisplay = $"{status.FrameSecondsRemaining}s";
             else
                 CountdownDisplay = "";
+
+            ReceiverModeAlert = status.ReceiverModeAlert;
+
+            // Keep tick state in sync for the NoSignal decay (no heartbeat fires then).
+            if (status.TickState != _tickLockState)
+            {
+                _tickLockState = status.TickState;
+                OnPropertyChanged(nameof(TickLockText));
+                OnPropertyChanged(nameof(TickDotColor));
+            }
         });
     }
 
@@ -688,7 +800,7 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
 
     private void Log(string message)
     {
-        var entry = $"{DateTime.Now:HH:mm:ss}  {message}";
+        var entry = $"{DateTime.Now:HH:mm:ss}  {DateTime.UtcNow:HH:mm:ss}Z  {message}";
         _fileLogger.WriteLine(entry);
         Application.Current?.Dispatcher.InvokeAsync(() =>
         {
@@ -716,12 +828,12 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         _audioInput?.Dispose();
         _fileLogger?.Dispose();
+        _diagLogger?.Dispose();
     }
 
     private DecoderRuntimeSettingsSnapshot GetDecoderSettings() =>
         new(
             EnableAgc: _enableInputAgc,
-            EnableAle: _enableAle,
             EnableAdaptiveLowpass: _enableAdaptiveLowpass,
             InputTrimDb: _inputTrimDb);
 }

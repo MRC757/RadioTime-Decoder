@@ -363,6 +363,9 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="8"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="110"/>
@@ -412,6 +415,43 @@
                                Style="{StaticResource LabelStyle}"
                                Foreground="{Binding LockState, Converter={StaticResource LockStateToColor}}"/>
                 </StackPanel>
+
+                <!-- 1 kHz tick lock indicator -->
+                <TextBlock Grid.Row="6" Grid.Column="0" Text="1 kHz Tick" Style="{StaticResource LabelStyle}"/>
+                <StackPanel Grid.Row="6" Grid.Column="1"
+                            Orientation="Horizontal" VerticalAlignment="Center">
+                    <Ellipse Width="10" Height="10" Margin="0,0,7,0"
+                             Fill="{Binding TickDotColor}"
+                             Opacity="{Binding TickDotOpacity}"/>
+                    <TextBlock Text="{Binding TickLockText}"
+                               Style="{StaticResource LabelStyle}"
+                               Foreground="{Binding TickDotColor}"/>
+                </StackPanel>
+
+                <!-- Minute tone detected indicator -->
+                <StackPanel Grid.Row="6" Grid.Column="2"
+                            Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                    <Ellipse Width="10" Height="10" Margin="0,0,5,0"
+                             Fill="#89DCEB"
+                             Opacity="{Binding MinuteDotOpacity}"/>
+                    <TextBlock Text="Min"
+                               Style="{StaticResource LabelStyle}"
+                               Foreground="#89DCEB"
+                               Opacity="{Binding MinuteDotOpacity}"/>
+                </StackPanel>
+
+                <!-- Receiver mode alert banner -->
+                <Border Grid.Row="7" Grid.ColumnSpan="3"
+                        Background="#F38BA8" CornerRadius="4" Padding="8,5"
+                        Margin="0,8,0,0"
+                        Visibility="{Binding ReceiverModeAlert, Converter={StaticResource NonEmptyToVisible}}">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="⚠  " Foreground="#1E1E2E" FontWeight="Bold" FontSize="11" VerticalAlignment="Center"/>
+                        <TextBlock Text="{Binding ReceiverModeAlert}"
+                                   Foreground="#1E1E2E" FontSize="11" FontWeight="SemiBold"
+                                   VerticalAlignment="Center" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
             </Grid>
         </Border>
 
@@ -442,10 +482,6 @@
                 <WrapPanel Margin="0,0,0,8">
                     <CheckBox Content="AGC"
                               IsChecked="{Binding EnableInputAgc}"
-                              Foreground="#CDD6F4"
-                              Margin="0,0,14,0"/>
-                    <CheckBox Content="ALE"
-                              IsChecked="{Binding EnableAle}"
                               Foreground="#CDD6F4"
                               Margin="0,0,14,0"/>
                     <CheckBox Content="Adaptive LP"

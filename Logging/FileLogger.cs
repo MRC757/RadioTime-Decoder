@@ -28,7 +28,7 @@ public sealed class FileLogger : IDisposable
         };
 
         // Write a session-start banner
-        WriteLine($"--- Session started {DateTime.Now:yyyy-MM-dd HH:mm:ss} ---");
+        WriteLine($"--- Session started {DateTime.Now:yyyy-MM-dd HH:mm:ss}  {DateTime.UtcNow:HH:mm:ss}Z ---");
     }
 
     /// <summary>

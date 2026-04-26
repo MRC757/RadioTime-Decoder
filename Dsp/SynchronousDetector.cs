@@ -53,11 +53,15 @@ public class SynchronousDetector
     }
     private double _freqOffsetHz;
 
+    private double _lowpassHz;
+
     /// <summary>Lowpass cutoff frequency (Hz). Narrow after PLL locks to improve SNR.</summary>
     public double LowpassHz
     {
+        get => _lowpassHz;
         set
         {
+            _lowpassHz = value;
             double rc = 1.0 / (2.0 * Math.PI * value);
             double dt = 1.0 / _sampleRate;
             _lpAlpha = dt / (rc + dt);
@@ -83,10 +87,8 @@ public class SynchronousDetector
         _subcarrierHz = subcarrierHz;
         _omega = 2.0 * Math.PI * subcarrierHz / sampleRate;
 
-        // Single-pole IIR lowpass: α = dt / (RC + dt), RC = 1 / (2π·cutoff)
-        double rc = 1.0 / (2.0 * Math.PI * lowpassHz);
-        double dt = 1.0 / sampleRate;
-        _lpAlpha = dt / (rc + dt);
+        // Single-pole IIR lowpass: set via property so _lowpassHz is initialised.
+        LowpassHz = lowpassHz;
 
         _noiseInterval = sampleRate / 10; // update every ~100 ms
     }

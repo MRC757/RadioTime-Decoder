@@ -19,7 +19,24 @@ public sealed class SyncQualityScorer
     private readonly float[] _accumBuffer;
     private int _accumCount;
 
+    // PLL-derived carrier center frequency. Updated by DecoderPipeline after each PLL
+    // correction so the Goertzel search is centred on the true carrier rather than
+    // blindly scanning integer bins 95–105 Hz.  Defaults to 100.0 before first lock.
+    private double _carrierCenterHz = 100.0;
+
     public double BestFrequencyHz { get; private set; } = 100.0;
+
+    /// <summary>Goertzel-derived carrier spectral score (0–1), before cadence weighting.</summary>
+    public double CarrierScore => _carrierScore;
+
+    /// <summary>Pulse-cadence regularity score (0–1). Decays if pulses stop arriving at ~1 Hz.</summary>
+    public double CadenceScore => _cadenceScore;
+
+    /// <summary>
+    /// Set the known carrier frequency (subcarrier + PLL offset) so the Goertzel search
+    /// centres on the actual carrier.  Call this after each PLL update.
+    /// </summary>
+    public void UpdateCarrierCenter(double hz) => _carrierCenterHz = Math.Clamp(hz, 90.0, 110.0);
 
     public double SyncScorePercent =>
         Math.Clamp((0.65 * _carrierScore + 0.35 * _cadenceScore) * 100.0, 0.0, 100.0);
@@ -91,18 +108,26 @@ public sealed class SyncQualityScorer
 
     private void RunGoertzelAnalysis(float[] samples)
     {
-        const int minHz = 95;
-        const int maxHz = 105;
+        // Scan ±4 Hz around the PLL-corrected carrier in 0.25 Hz steps.
+        // Integer-Hz scanning caused up to ±0.5 Hz quantization error: when the carrier
+        // sits between two integer bins, power splits between them and both dominance and
+        // prominence fall, capping the score even on a strong clean signal.  Fine stepping
+        // eliminates this — the peak bin lands within 0.125 Hz of the true carrier.
+        const double span = 4.0;
+        const double step = 0.25;
+        double center = _carrierCenterHz;
 
         double bestPower   = 0;
         double secondPower = 0;
         double sumPower    = 0;
-        int    bestHz      = 100;
+        double bestHz      = center;
+        int    binCount    = 0;
 
-        for (int hz = minHz; hz <= maxHz; hz++)
+        for (double hz = center - span; hz <= center + span + 1e-9; hz += step)
         {
             double power = GoertzelPower(samples, hz);
             sumPower += power;
+            binCount++;
 
             if (power > bestPower)
             {
@@ -116,7 +141,7 @@ public sealed class SyncQualityScorer
             }
         }
 
-        double meanOther = (sumPower - bestPower) / Math.Max(1, maxHz - minHz);
+        double meanOther = (sumPower - bestPower) / Math.Max(1, binCount - 1);
         double dominance = bestPower > 1e-12 ? (bestPower - secondPower) / bestPower : 0.0;
         double prominence = bestPower / (meanOther + 1e-12);
 
