@@ -570,7 +570,13 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         private set { _confidenceDisplay = value; OnPropertyChanged(); }
     }
 
-    public bool CanSetClock => _latestFrame != null && _latestFrame.IsValid && _latestFrame.ConfidenceFrames >= 2;
+    // Hours and minutes are only trusted after this many consecutive Markov-verified
+    // increments.  Each count represents one observed +1-minute transition that matched
+    // the predicted timeline — so 3 means four consecutive correctly-decoded frames.
+    private const int TimeConfidenceThreshold = 3;
+
+    public bool CanSetClock => _latestFrame != null && _latestFrame.IsValid
+                               && _latestFrame.ConfidenceFrames >= TimeConfidenceThreshold;
 
     // ── Commands ──────────────────────────────────────────────────────────────
 
@@ -772,22 +778,37 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             _latestFrame = frame;
             var t = frame.UtcTime;
-            DecodedTimeDisplay = $"{t:HH:mm:ss} UTC";
+
+            // Date, DUT1, DST, and leap-second come from slow BCD fields (DOY/year) that
+            // have their own confirmation mechanism.  Update them on every accepted frame.
             DecodedDateDisplay = $"{t:MMM dd, yyyy}  ·  Day {t.DayOfYear:D3}";
             DayOfYear = t.DayOfYear.ToString("D3");
-            RefreshLocalTime();
             Dut1Display = $"{frame.Dut1Seconds:+0.0;-0.0} s";
             DstDisplay = frame.DstActive ? "Active" : "Off";
             LeapSecondDisplay = frame.LeapSecondPending ? "Pending" : "None";
 
-            int needed = 2;
-            ConfidencePercent = Math.Min(100, (frame.ConfidenceFrames / (double)needed) * 100);
-            ConfidenceDisplay = $"{Math.Min(frame.ConfidenceFrames, needed)} / {needed}";
+            // Hours and minutes are only shown after TimeConfidenceThreshold consecutive
+            // Markov-verified increments.  Before that the display holds "--:--" so a
+            // bootstrapping wrong-time decode never reaches the user or SetClock.
+            bool timeConfirmed = frame.ConfidenceFrames >= TimeConfidenceThreshold;
+            if (timeConfirmed)
+            {
+                DecodedTimeDisplay = $"{t:HH:mm:ss} UTC";
+                RefreshLocalTime();
+            }
+
+            ConfidencePercent = Math.Min(100,
+                (frame.ConfidenceFrames / (double)TimeConfidenceThreshold) * 100);
+            ConfidenceDisplay =
+                $"{Math.Min(frame.ConfidenceFrames, TimeConfidenceThreshold)} / {TimeConfidenceThreshold}";
 
             OnPropertyChanged(nameof(CanSetClock));
 
-            if (frame.IsValid && frame.ConfidenceFrames >= needed)
-                Log($"Frame valid: {t:yyyy-MM-dd HH:mm:ss} UTC  DUT1={frame.Dut1Seconds:+0.0;-0.0}s");
+            if (timeConfirmed)
+                Log($"Frame confirmed: {t:yyyy-MM-dd HH:mm:ss} UTC  DUT1={frame.Dut1Seconds:+0.0;-0.0}s");
+            else
+                Log($"Frame decoded (unconfirmed {frame.ConfidenceFrames}/{TimeConfidenceThreshold}): " +
+                    $"{t:yyyy-MM-dd HH:mm} UTC");
         });
     }
 

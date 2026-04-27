@@ -102,7 +102,10 @@ public class FrameDecoder
     // When the 1000 Hz tick detector fires a MinutePulse, this gap confirmation is
     // bypassed — the minute pulse is unambiguous without needing a second Marker.
     // 0 = not set (equivalent to DateTime.MinValue).
-    private long _candidateAnchorTick;
+    private long   _candidateAnchorTick;
+    // Time from UTC second 0 to when the candidate P0 100 Hz Marker fired (30 ms rise + EffectiveDuration).
+    // Used to back-project _candidateAnchorTick to the true second-0 epoch in _anchorWallTick.
+    private double _candidateP0OffsetSeconds;
 
     // Per-bit state flags for the visualization grid (set in StoreBit / gap-fill / correction).
     private readonly bool[] _bitGapFilled = new bool[60];
@@ -114,6 +117,15 @@ public class FrameDecoder
     // bit counter has drifted (gap fills or double-triggers have shifted the index).
     // 0 = not set. Stopwatch timestamps are always positive.
     private long _anchorWallTick;
+
+    // Anchor-phase diagnostic state.
+    // Captures the minute-pulse anchor parameters so the very next SecondTick can be
+    // logged with its gap from end-of-minute-pulse and its elapsed-since-anchor value.
+    // If back-projection is correct, gap ≈ 200 ms (1.0 s tick interval − 0.8 s pulse end)
+    // and elapsed-since-anchor ≈ 1.0 s, yielding tickBit=1.
+    private long   _diagMinutePulseEndTick;
+    private double _diagMinutePulseWidth;
+    private bool   _diagAwaitingFirstSecondTick;
 
     // Pending 1000 Hz second-tick state.
     // Each second tick (except 29 and 59, which are omitted per NIST) records the
@@ -241,9 +253,10 @@ public class FrameDecoder
         _frameTotal = 0;
         _clockExpected = null;
         _clockVerifiedCount = 0;
-        _candidateAnchorTick  = 0;
-        _anchorWallTick       = 0;
-        _skip100HzP0UntilTick = 0;
+        _candidateAnchorTick    = 0;
+        _candidateP0OffsetSeconds = 0;
+        _anchorWallTick         = 0;
+        _skip100HzP0UntilTick   = 0;
         _tickPendingBitIndex      = -1;
         _tickPendingTimestamp     = 0;
         _lastSignalPercent        = 0;
@@ -474,8 +487,17 @@ public class FrameDecoder
                     if (_candidateAnchorTick == 0)
                     {
                         // First Marker seen — record as candidate P0, wait for P1 to confirm.
-                        _candidateAnchorTick = now;
+                        _candidateAnchorTick      = now;
+                        // 100 Hz carrier rises ~30 ms after the second tick, then holds HIGH
+                        // for EffectiveDuration. This offset projects the fire time back to
+                        // the true second-0 epoch when P0→P1 is later confirmed.
+                        _candidateP0OffsetSeconds = 0.030 + pulse.EffectiveDuration;
                         _onLog?.Invoke($"Candidate P0 (width={pulse.WidthSeconds:F3}s) — waiting for P1 in ~9s");
+                        _onLog?.Invoke($"[Anchor diag] P0→P1 fallback candidate: " +
+                                       $"100 Hz Marker width={pulse.WidthSeconds * 1000:F1}ms, " +
+                                       $"effDuration={pulse.EffectiveDuration * 1000:F1}ms, " +
+                                       $"projected offset = (Marker end) − {_candidateP0OffsetSeconds * 1000:F1}ms " +
+                                       $"(30 ms rise delay + effDuration)");
                     }
                     else
                     {
@@ -498,9 +520,12 @@ public class FrameDecoder
                             _lastStoredPulseType = PulseType.Marker;
                             _lockQuality = 0.15; // partial credit for confirmed P0→P1 pair
                             _frameHits = 2; _frameTotal = 2; // two confirmed markers: P0 and P1
-                            _candidateAnchorTick = 0;
-                            // Record P0 monotonic time: P1 arrived now, P0 was ~9 s ago.
-                            _anchorWallTick = now - SecondsToTicks(interMarkerGap);
+                            // Back-project to true second-0 epoch: _candidateAnchorTick is
+                            // when the P0 100 Hz Marker fired (rise delay + HIGH duration
+                            // after second 0). Subtracting the stored offset gives UTC second 0.
+                            _anchorWallTick = _candidateAnchorTick - SecondsToTicks(_candidateP0OffsetSeconds);
+                            _candidateAnchorTick    = 0;
+                            _candidateP0OffsetSeconds = 0;
                             _onLog?.Invoke($"Confirmed P0→P1 ({interMarkerGap:F1}s gap) → SYNCING at bit 10");
                             ReportStatus(signalPercent);
                             PublishFrameVisualization();
@@ -617,6 +642,24 @@ public class FrameDecoder
             long tickNow = _getTimestamp();
             double elapsed = TicksToSeconds(tickNow - _anchorWallTick);
             int tickBit = (int)Math.Round(elapsed) % 60;
+
+            // Anchor-phase diagnostic: log the very first SecondTick after a minute anchor.
+            // Reveals whether the back-projection of _anchorWallTick is correct.
+            //   gap          = time from end-of-minute-pulse to this tick (expect ~200 ms)
+            //   elapsed      = time from _anchorWallTick to this tick    (expect ~1000 ms)
+            //   roundError   = elapsed − round(elapsed)                   (≈ 0 if anchor true)
+            // A non-zero roundError or a tickBit ≠ 1 means the anchor is off, and that
+            // offset will systematically distort every bit window in the frame.
+            if (_diagAwaitingFirstSecondTick)
+            {
+                _diagAwaitingFirstSecondTick = false;
+                double gap        = TicksToSeconds(tickNow - _diagMinutePulseEndTick);
+                double roundError = elapsed - Math.Round(elapsed);
+                _onLog?.Invoke($"[Anchor diag] First SecondTick after MinutePulse: " +
+                               $"gap={gap * 1000:F1}ms (expect ~200 ms), " +
+                               $"elapsed-since-anchor={elapsed * 1000:F1}ms (expect ~1000 ms), " +
+                               $"round-error={roundError * 1000:+0.0;-0.0}ms, tickBit={tickBit} (expect 1)");
+            }
 
             // Record arrival for tick-based fade detection regardless of whether this
             // position is 29/59. A received tick always resets the missing-tick counter.
@@ -743,7 +786,22 @@ public class FrameDecoder
         _frameTotal = 1;
         _lastStoredPulseType = PulseType.Marker;
         _candidateAnchorTick = 0;
-        _anchorWallTick = now; // minute pulse fires at P0 — record exact anchor time
+        // Back-project to the true second-0 epoch: the TickDetector fires at the END
+        // of the 800 ms minute pulse. Subtracting the measured width gives UTC second 0,
+        // so (tickNow - _anchorWallTick) for second-N ticks equals N seconds (not N-1).
+        _anchorWallTick = now - SecondsToTicks(tick.WidthSeconds);
+
+        // Anchor-phase diagnostic: capture the minute-pulse parameters so the very next
+        // SecondTick handler can log its arrival timing relative to this anchor. If the
+        // back-projection at line above is correct, the next SecondTick (real second 1)
+        // should arrive ~200 ms after the minute pulse ended, and elapsed-since-anchor
+        // should be ~1.0 s (tickBit=1).
+        _diagMinutePulseEndTick      = now;
+        _diagMinutePulseWidth        = tick.WidthSeconds;
+        _diagAwaitingFirstSecondTick = true;
+        _onLog?.Invoke($"[Anchor diag] MinutePulse end-of-tone: width={tick.WidthSeconds * 1000:F1}ms, " +
+                       $"projected anchor = (end-of-tone) − {tick.WidthSeconds * 1000:F1}ms " +
+                       $"(nominal width = 800.0 ms)");
 
         // Reset the inter-pulse gap timer to P0 so the gap-fill algorithm measures gaps
         // relative to this anchor, not to the last 100 Hz pulse from the previous minute.
@@ -1018,15 +1076,27 @@ public class FrameDecoder
                     _clockVerifiedCount++;
                     _onLog?.Invoke($"Verified #{_clockVerifiedCount}: {frame.UtcTime:HH:mm} " +
                                    $"(drift {drift:+0.0;-0.0}s from expected)");
+                    _clockExpected = frame.UtcTime.AddMinutes(1);
                 }
                 else
                 {
+                    // Reject the frame: the decoded time is inconsistent with the
+                    // established timeline. Advance _clockExpected by one minute based
+                    // on the last good prediction so subsequent frames continue to be
+                    // checked against the correct timeline rather than the wrong decoded time.
                     _onLog?.Invoke($"Clock mismatch: expected {_clockExpected.Value:HH:mm} " +
-                                   $"got {frame.UtcTime:HH:mm} (drift {drift:+0.0;-0.0}s) — possible misalignment");
+                                   $"got {frame.UtcTime:HH:mm} (drift {drift:+0.0;-0.0}s) — rejected");
                     _clockVerifiedCount = 0;
+                    _clockExpected = _clockExpected.Value.AddMinutes(1);
+                    frame = null;
                 }
             }
-            _clockExpected = frame.UtcTime.AddMinutes(1);
+            else
+            {
+                // First decode — no prior reference. Accept unconditionally and
+                // establish the baseline for subsequent Markov checks.
+                _clockExpected = frame.UtcTime.AddMinutes(1);
+            }
 
             // Update the persistent slow-bit store from this validated frame.
             // Only slow-changing positions are stored (DOY, year, DUT1, DST, leap).
@@ -1043,7 +1113,11 @@ public class FrameDecoder
             _consecutiveInvalid = 0;
             _lockQuality = Math.Min(1.0, _lockQuality + 0.2);
 
-            frame.ConfidenceFrames = _consecutiveValid;
+            // ConfidenceFrames counts Markov-verified increments, not raw accepted frames.
+            // First-frame decodes have ConfidenceFrames=0; the count only rises after
+            // the second and subsequent frames each pass the drift-≤30s clock check.
+            // The UI gates the hours/minutes display on ConfidenceFrames >= 3.
+            frame.ConfidenceFrames = _clockVerifiedCount;
             _latestFrame = frame;
             _state = State.Locked;
 
@@ -1206,17 +1280,20 @@ public class FrameDecoder
             bool aHigh = _envSampleA > threshold;
             bool bHigh = envelope    > threshold;
 
-            const double AlphaStrong = 0.50; // update step for a clear Zero or One reading
+            // Alpha cap: slow bits with a known persistent-store value are protected against
+            // single large-swing measurements — same policy as TryDecode.
+            bool isProtectedSlowBit = SlowBitPositions.Contains(bitPos) && _persistentBits[bitPos] >= 0;
+            double alpha = isProtectedSlowBit ? 0.10 : 0.50;
 
             if (aHigh)
             {
                 // Carrier HIGH at 350 ms → bit is Zero (carrier returned within 200 ms LOW)
-                _bitAccumulator[bitPos] += AlphaStrong * (-1.0 - _bitAccumulator[bitPos]);
+                _bitAccumulator[bitPos] += alpha * (-1.0 - _bitAccumulator[bitPos]);
             }
             else if (bHigh)
             {
                 // Carrier LOW at 350 ms, HIGH at 650 ms → bit is One (500 ms LOW period)
-                _bitAccumulator[bitPos] += AlphaStrong * (+1.0 - _bitAccumulator[bitPos]);
+                _bitAccumulator[bitPos] += alpha * (+1.0 - _bitAccumulator[bitPos]);
             }
             // Both LOW → Marker or fade erasure — no accumulator update
             // (the accumulator decays in TryDecode when the 100 Hz channel also erases it)
@@ -1340,9 +1417,10 @@ public class FrameDecoder
         _frameTotal = 0;
         _clockExpected = null;
         _clockVerifiedCount = 0;
-        _candidateAnchorTick = 0;
-        _skip100HzP0UntilTick = 0;
-        _lastPulseWasSynthetic = false;
+        _candidateAnchorTick      = 0;
+        _candidateP0OffsetSeconds = 0;
+        _skip100HzP0UntilTick     = 0;
+        _lastPulseWasSynthetic    = false;
         TickFadeActive = false;
         _envTickBitPos = -1;
         _envGotA       = false;

@@ -1,8 +1,8 @@
 # RadioTime Decoder
 
 > [!WARNING]
-> **This program is under active development and is not yet reliable.**
-> Decoding under real HF propagation conditions is inconsistent — ionospheric fading routinely corrupts 50–90% of each 60-bit frame, and decoded times may be wrong or absent. The software is shared for development and experimentation purposes only. Do not use it as a time reference for anything that matters.
+> **This program is under active development.**
+> Decoding under real HF propagation conditions depends on signal quality — ionospheric fading can corrupt 50–90% of each 60-bit frame, and decoded times may be absent or delayed during poor propagation. The software is shared for development and experimentation purposes. Do not use it as a time reference for anything safety-critical.
 
 <img width="787" height="1345" alt="Screenshot 2026-04-17 222022" src="https://github.com/user-attachments/assets/99a63b3c-f924-4aab-bfe7-5c516873457f" />
 
@@ -14,11 +14,10 @@ Built with WPF (.NET 9) and the MVVM pattern. Dark-themed UI with real-time sign
 
 ## Features
 
-- **Real-time BCD time-code decoding** from the 100 Hz audio subcarrier used by WWV-family stations
-- **1000 Hz tick detector** — detects the WWV second ticks and the 800 ms minute pulse on the separate 1000 Hz audio channel; minute pulse directly anchors P0 without waiting for a 9-second inter-marker gap
-- **Adaptive Line Enhancer (ALE)** — NLMS predictor placed before the synchronous detector; extracts the periodic 100 Hz subcarrier from broadband noise, providing ~6–10 dB additional noise suppression before coherent demodulation
+- **Real-time BCD time-code decoding** from the 100 Hz audio subcarrier used by WWV-family stations (NIST IRIG-H positive-pulse format)
+- **1000 Hz tick detector** — detects the WWV second ticks and the 800 ms minute pulse on the separate 1000 Hz audio channel; minute pulse directly anchors P0 without waiting for a 9-second inter-marker gap; anchor is back-projected to the exact UTC second-0 epoch so tick-derived bit indices are accurate throughout the frame
 - **Coherent synchronous (lock-in) detector** — demodulates the 100 Hz subcarrier with a narrow IQ lowpass (2 Hz nominal, widening to 8 Hz during HF fading), giving 15–25 dB better SNR than a simple bandpass + rectifier
-- **Matched-filter pulse classification** — classifies pulses by counting genuinely-LOW samples rather than edge timing, removing systematic bias from the envelope's rise/fall time; classification reference uses a 75th-percentile carrier estimate (fade-resistant) rather than the real-time IIR tracker
+- **Matched-filter pulse classification** — classifies pulses by counting samples above the midpoint threshold (HIGH-period duration), removing systematic bias from the envelope's rise/fall time; classification reference uses a 75th-percentile carrier estimate (fade-resistant) rather than the real-time IIR tracker
 - **Percentile carrier reference** — tracks the 75th percentile of the last 30 inter-pulse HIGH-period peaks; multipath constructive spikes and HF-fade-depressed HIGH periods are outliers in this window and do not distort the classification threshold
 - **Ionospheric fade detection** — `IsFading` flag correctly triggers when the envelope drops below 15% of the stable carrier reference for > 200 ms; fade-corrupted pulses receive zero confidence weight so they cannot corrupt the per-bit accumulator
 - **Per-bit accumulation voting** (NTP driver 36 §3.2) — each of the 60 bit positions carries a signed evidence score (positive = One, negative = Zero) updated with an exponential moving average each minute; confident measurements push the score toward ±1; erasures apply a slow 0.90 decay so clean-frame evidence persists through several faded minutes; the vote threshold is ±0.15, below which the persistent store or structure default wins
@@ -27,7 +26,7 @@ Built with WPF (.NET 9) and the MVVM pattern. Dark-themed UI with real-time sign
 - **Operator UTC date hint** — the operator can enter today's UTC date (yyyy-MM-dd) before or during listening; the decoder immediately pre-fills the 18 DOY and year bit positions, reducing the number of bits that must be received from 60 to ~13 under poor propagation; the hint is overwritten automatically by the first successful frame decode
 - **P0→P1 gap confirmation** — when only the 100 Hz channel is available, validates the unique 9-second gap between P0 and P1 before anchoring, preventing the reset loop caused by marker-length noise during deep fades
 - **Marker saturation gate** — detects deep ionospheric fades (>60% Marker rate in the last 20 pulses) and pauses anchor attempts until the signal recovers
-- **Markov clock validation** — after each successful decode, advances the expected time by one minute and compares it against the next decode; a mismatch >30 s indicates frame misalignment
+- **Markov clock validation** — after each successful decode, advances the expected time by one minute and compares it against the next decode; a drift >30 s causes the frame to be **rejected** and the reference to advance from the last good prediction (not from the wrong decode), preventing a single bad bootstrapping frame from locking in a wrong time indefinitely
 - **Gap filling** — when the signal drops for 2–30 seconds, estimates skipped bit positions from wall-clock time rather than resetting, so short ionospheric blackouts don't restart the 60-second collection window
 - **Reserved-bit validation** — rejects frames where WWV's reserved positions are non-zero (indicates wrong alignment or heavy corruption)
 - **Signal strength meter** with dB readout and adaptive noise-floor tracking
@@ -35,7 +34,7 @@ Built with WPF (.NET 9) and the MVVM pattern. Dark-themed UI with real-time sign
 - **Lock quality indicator** showing decoder synchronization progress (Searching → Syncing → Locked)
 - **Frame countdown** — 60-second timer showing seconds remaining until the next decode attempt
 - **Decoded time display** — UTC time, day-of-year, DUT1 offset, DST status, leap-second warning
-- **Confidence tracking** — requires 2 consecutive valid frames before enabling clock set
+- **Confidence tracking** — hours and minutes are withheld from the display until 3 consecutive Markov-verified increments are observed (four back-to-back correctly decoded frames); "Set Clock" requires the same threshold; earlier frames still update date, DUT1, and DST
 - **System clock synchronization** — sets Windows system time from decoded UTC (requires Administrator)
 - **Worldwide station reference database** — 11 HF time-signal stations with frequencies, coordinates, and operating status
 - **Activity log** with file persistence to `%APPDATA%\WwvDecoder\`
@@ -155,7 +154,7 @@ Play a recording of a WWV broadcast through a virtual audio cable or loopback de
    - **Searching** — looking for a valid anchor pulse to orient on
    - **Syncing** — found an anchor, counting down through a 60-second frame
    - **Locked** — successfully decoded a valid frame; continuing to decode
-6. Once locked with 2+ consecutive valid frames, the **"Set Clock"** button becomes active
+6. Once the decoder has seen 3 consecutive Markov-verified time increments (Confidence 3/3), hours and minutes appear and the **"Set Clock"** button becomes active
 
 ### UTC Date Hint (Optional)
 
@@ -201,7 +200,7 @@ The text to the right shows both a **frame countdown** and the **lock state**:
 - `SEARCHING` — no countdown yet; waiting for the first anchor pulse
 
 #### Confidence
-Number of consecutive valid frames decoded. The "Set Clock" button activates at 2/2. Each frame takes 60 seconds, so reaching 2/2 from cold start takes approximately 2 minutes.
+Number of consecutive Markov-verified time increments. Each count represents one observed +1-minute transition that matched the predicted timeline. The "Set Clock" button and the hours/minutes display activate at 3/3. Each frame takes 60 seconds, so reaching 3/3 from cold start takes approximately 4 minutes (first frame establishes the baseline; three more verify it).
 
 ### Reading the Decoded Time
 
@@ -220,13 +219,13 @@ Click **"Station Reference Table"** to open the full database of worldwide HF ti
 
 ### WWV Time Code Format
 
-Each second of the WWV broadcast encodes one bit via the duration of a **reduced-power period** on the 100 Hz subcarrier. The subcarrier is always present; bits are encoded by briefly reducing its power level by 10 dB.
+Each second of the WWV broadcast encodes one bit via the duration of a **HIGH-power period** on the 100 Hz subcarrier. The subcarrier is normally absent or at a low baseline level; approximately 30 ms after each 1 kHz second tick it rises to full power and holds there for a duration that encodes the bit type before dropping back to baseline (NIST IRIG-H positive-pulse format).
 
-| Bit Value | LOW Duration | HIGH Duration | Meaning |
-|-----------|-------------|---------------|---------|
-| 0 (Zero) | 0.170 s | ~0.830 s | Binary 0 |
-| 1 (One) | 0.470 s | ~0.530 s | Binary 1 |
-| Marker | 0.770 s | ~0.230 s | Frame position marker |
+| Bit Value | HIGH Duration | LOW Duration | Meaning |
+|-----------|--------------|--------------|---------|
+| 0 (Zero)  | ~0.200 s     | ~0.800 s     | Binary 0 |
+| 1 (One)   | ~0.500 s     | ~0.500 s     | Binary 1 |
+| Marker    | ~0.800 s     | ~0.200 s     | Frame position marker |
 
 In addition, WWV broadcasts **1000 Hz tone bursts** at the start of each second (5 ms ticks) and the start of each minute (800 ms minute pulse). These carry no BCD data but provide precise second-epoch timing and an unambiguous P0 anchor.
 
@@ -271,28 +270,23 @@ Audio In (22,050 Hz, 16-bit mono, 50 ms blocks)
     ├─────────────────────────────────────────────┐
     │  100 Hz BCD channel                         │  1000 Hz tone channel
     ▼                                             ▼
-[5] Adaptive Line Enhancer (ALE)             [8] Tick Detector
-    │  NLMS, delay=5, 128 taps, μ=0.3             │  IQ demodulation at 1000 Hz
-    │  Extracts periodic 100 Hz component         │  Lowpass: 150 Hz (resolves 5 ms tick)
-    │  Suppresses broadband noise by ~6–10 dB     │  Adaptive level: 2 ms attack / 3 s decay
-    │                                             │  Classifies:
-    ▼                                             │    ≤50 ms  → SecondTick (5 ms tick)
-[6] Synchronous (Lock-In) Detector               │    ≥500 ms → MinutePulse (P0 anchor)
-    │  IQ demodulation at 100 Hz                  │
-    │  Lowpass: 2 Hz (nominal, stable signal)      │
-    │  → 8 Hz when HF fading detected (adaptive)  │
-    │  Envelope = 2·√(I²+Q²)                      │
-    │  SNR improvement: 15–25 dB                  │
-    │                                             │
+[5] Synchronous (Lock-In) Detector           [6] Tick Detector
+    │  IQ demodulation at 100 Hz                  │  IQ demodulation at 1000 Hz
+    │  Lowpass: 2 Hz (nominal, stable signal)      │  Lowpass: 150 Hz (resolves 5 ms tick)
+    │  → 8 Hz when HF fading detected (adaptive)  │  Adaptive level: 2 ms attack / 3 s decay
+    │  Envelope = 2·√(I²+Q²)                      │  Classifies:
+    │  SNR improvement: 15–25 dB                  │    ≤50 ms  → SecondTick (5 ms tick)
+    │                                             │    ≥700 ms → MinutePulse (P0 anchor)
     ▼                                             │
 [7] Pulse Detector                               │
-    │  Hysteretic: enter 55% HIGH, exit 62% HIGH  │
-    │  30 ms dropout tolerance                    │
+    │  Tick-anchored positive-pulse detection     │
+    │  NotifyTick() arms 200 ms rising-edge window│
     │  Weak-signal guard: suppress if H < 3×noise │
+    │  IsFading: 1 kHz tick amplitude IIR         │
     │                                             │
     ▼                                             │
 [7a] Matched Filter                              │
-    │  Counts samples < 50% HIGH                  │
+    │  Counts samples > 50% HIGH (HIGH duration)  │
     │  Tick / Zero / One / Marker classification  │
     │                                             │
     └──────────────────┬──────────────────────────┘
@@ -393,7 +387,7 @@ The synchronous detector's lowpass defaults to **2 Hz** — a narrow bandwidth t
 No carrier PLL is used. The 100 Hz subcarrier is derived directly from the NIST atomic clock standard and is amplitude-keyed (on/off) — it is not frequency-modulated. The 100 Hz frequency in AM-demodulated baseband audio is exact by definition: the SDR local-oscillator offset shifts the HF carrier but the 100 Hz subcarrier is generated by dividing the station's on-site atomic standard, so it remains at exactly 100 Hz after AM demodulation regardless of receiver tuning error. A frequency-tracking PLL would be solving a problem that does not exist.
 
 #### Pulse Detector
-Converts the amplitude envelope into discrete pulse events by measuring how long the carrier stays below a threshold.
+Converts the amplitude envelope into discrete pulse events by measuring the duration of the positive-pulse HIGH period following each second tick. Detection is tick-anchored: each 1 kHz `NotifyTick()` call closes any open pulse from the previous second and arms a 200 ms rising-edge window for the next one.
 
 `levelHigh` is tracked by two mechanisms with different purposes:
 
@@ -408,9 +402,9 @@ A **weak-signal guard** suppresses all pulse detection while the HIGH level is l
 **Fade detection** (`IsFading` flag): fires when the envelope has been below **15% of the stable carrier reference** for more than 200 ms. The WWV LOW carrier is ~31% of HIGH — well above the 15% threshold — so normal pulse LOW periods never trigger it. Deep HF fades drop the envelope to noise level (<5%), correctly setting `IsFading = true`. Once set, recovery requires 500 ms of continuous signal and the IIR level recovering to ≥ 60% of the running peak envelope. Pulses emitted while `IsFading` carry zero confidence weight and are treated as erasures by the multi-frame accumulator.
 
 #### Matched Filter
-At the end of each detected pulse, the matched filter classifies it by counting how many envelope samples were below the midpoint between HIGH and LOW carrier levels (50% of HIGH). This "energy counting" is equivalent to correlating the envelope against a rectangular template for each pulse type — the optimal classifier in white Gaussian noise.
+At the end of each detected pulse, the matched filter classifies it by counting how many envelope samples were **above** the midpoint threshold (50% of `levelHigh`) — measuring the HIGH-period duration of the positive pulse. This binary count is equivalent to correlating the envelope against a rectangular HIGH-period template for each bit type — the optimal classifier in white Gaussian noise.
 
-This eliminates a systematic positive-duration bias: simple threshold-crossing measurement includes the ~20 ms envelope rise and fall times, making a 200 ms Zero pulse appear 40 ms longer than it is. The matched filter counts only samples genuinely in the LOW state, removing this bias. Classification boundaries are: < 50 ms = Tick, 50–350 ms = Zero, 350–650 ms = One, ≥ 650 ms = Marker.
+This eliminates a systematic bias from simple threshold-crossing measurement: the ~20 ms envelope rise and fall times would inflate a nominal 200 ms Zero pulse to ~240 ms. The matched filter counts only samples genuinely in the HIGH state, removing this bias. Classification boundaries calibrated from live SDR measurements: < 50 ms = Tick, 50–350 ms = Zero, 350–650 ms = One, ≥ 650 ms = Marker.
 
 The midpoint threshold uses the **percentile-based carrier reference** captured at pulse start, not the real-time IIR value. This solves two problems simultaneously: (1) the IIR decays during an 800 ms Marker's LOW period to ~76% of the true carrier, which would drop the midpoint threshold to 38% — dangerously close to the actual LOW carrier level at 31%; (2) multipath constructive interference spikes can inflate the IIR before a pulse, raising the midpoint above the LOW carrier so the matched filter counts zero genuine-LOW samples and misclassifies everything as a Tick. The percentile reference is immune to both: spikes are high outliers in the 30-entry window and do not shift the 75th percentile; HF-faded HIGH periods are low outliers and also do not shift it.
 
@@ -432,6 +426,8 @@ The minute pulse is an 800 ms burst of 1000 Hz tone at the start of second 0. Wh
 - The 1000 Hz tone is independent of BCD modulation depth — no amplitude ambiguity
 - The minute pulse is the loudest and longest feature in the audio signal
 - A single detection is sufficient — no second measurement needed for confirmation
+
+The `TickDetector` fires the `MinutePulse` event when the 800 ms pulse *ends*, approximately 800 ms after the true UTC second-0 boundary. The anchor is back-projected to the exact second-0 epoch by subtracting the measured pulse width, so the `elapsed` calculation for each subsequent second tick equals the true second number N rather than N−1. Without this correction, tick-derived bit indices are consistently one position low, causing bit[01] to be discarded after every P0 anchor and all subsequent bits to land one position early.
 
 When both channels detect P0 in the same audio block, the earlier arrival (whichever fired first) anchors while the second is treated as a confirmation and absorbed without being stored as bit 1.
 
@@ -503,20 +499,21 @@ The decoder applies four validation layers in order:
 All four must pass for a frame to produce a `TimeFrame` result.
 
 #### Markov Clock Validation
-After each successful decode, the expected time for the next minute is stored (`decoded time + 1 minute`). The next successful decode is compared to this expectation. A drift of more than 30 seconds is logged as a possible frame misalignment — the decoder may have re-anchored on the wrong P0 after a fade and is reporting one or more minutes ahead or behind. Consecutive verified decodes increment a counter shown in the log (`Verified #N: HH:MM (drift +0.4s from expected)`).
+After each successful decode, the expected time for the next minute is stored (`decoded time + 1 minute`). The next successful decode is compared to this expectation:
+
+- **Drift ≤ 30 s** — the frame is accepted, `_clockVerifiedCount` is incremented, and the expected time advances to `decoded time + 1 minute`. The log shows `Verified #N: HH:MM (drift +0.4s from expected)`.
+- **Drift > 30 s** — the frame is **rejected** (not emitted to the UI, `_clockVerifiedCount` resets to 0). The expected time advances by one minute from the **last good prediction**, not from the wrong decoded value. This prevents a single bad bootstrapping frame from corrupting the reference so that every subsequent consistent-wrong frame also passes.
+
+A rejected frame falls into the consecutive-invalid counter; two consecutive rejections trigger a full reset to Searching.
+
+**Hours and minutes are only displayed and eligible for clock set after `_clockVerifiedCount` reaches 3** — three back-to-back Markov-passing frames after the initial bootstrapping decode. Before that threshold the display shows `--:--:--` and date/DUT1/DST are still updated from their independently confirmed slow-bit fields.
+
+**Known limitation:** the Markov check compares successive decoded times, so it detects a fixed wrong-hours offset only at the moment of transition (when a good frame is followed by a wrong one). If the very first decoded frame has wrong hours *and* subsequent frames decode consistently to the same wrong time, the +1-minute increments will still verify. The three-frame threshold reduces the probability that a noise event produces three plausible-looking consecutive decodes, but does not fully eliminate it. An external time reference (NTP, operator-supplied time hint) would be required to catch this case definitively.
 
 #### Gap Filling
 When the signal drops for 2–30 seconds (the cadence guard detects the inter-pulse gap exceeds 2 s), the decoder estimates how many bits were missed using `round(gap) − 1` and fills those positions with default values: known marker positions receive value 2, all other positions receive 0. Filled positions are tagged as erased (not confident) and do not participate in the majority vote against confirmed bits from prior frames. If filling completes a 60-bit frame, decode is attempted immediately. Gaps longer than 30 seconds trigger a full reset to Searching rather than filling — too many unknowns to fill reliably.
 
 ---
-
-### Adaptive Line Enhancer (ALE)
-
-The `AdaptiveLineEnhancer` sits between the notch filters and the synchronous detector in the 100 Hz channel (step [5] in the pipeline). It uses Normalized Least Mean Squares (NLMS) with a delay of 5 samples, 128 filter taps, and step size μ = 0.3.
-
-It extracts the periodic 100 Hz subcarrier from broadband noise by exploiting temporal correlation: a delayed copy of the input predicts the current sample via an adaptive FIR filter. For a periodic signal the delayed copy is highly correlated with the current sample — the filter converges to reconstruct it. For broadband noise the delayed copy is uncorrelated, so the filter output approaches zero for noise. The NLMS normalization makes the effective step size independent of input level.
-
-In practice this provides roughly 6–10 dB of noise suppression in the 100 Hz path before the synchronous detector processes it. This improves pulse boundary clarity, especially on marginal HF signals. The ALE can be disabled from the settings panel for A/B comparison.
 
 ---
 
@@ -539,10 +536,10 @@ RadioTime Decoder/
 │   ├── NotchFilter.cs              # IIR biquad notch (60 Hz and 120 Hz instances)
 │   ├── SynchronousDetector.cs      # Coherent IQ lock-in detector for 100 Hz subcarrier
 │   ├── CarrierPll.cs               # Costas-loop PLL (not in active pipeline — 100 Hz is not frequency-modulated)
-│   ├── PulseDetector.cs            # Hysteretic pulse detection with gated HIGH tracking
-│   ├── MatchedFilter.cs            # Energy-counting matched filter for pulse classification
+│   ├── PulseDetector.cs            # Tick-anchored positive-pulse detection with gated HIGH tracking
+│   ├── MatchedFilter.cs            # HIGH-duration matched filter for pulse classification
 │   ├── TickDetector.cs             # 1000 Hz IQ demodulator; second ticks and minute pulse
-│   ├── AdaptiveLineEnhancer.cs     # NLMS adaptive line enhancer (ALE)
+│   ├── AdaptiveLineEnhancer.cs     # NLMS adaptive line enhancer (not in active pipeline)
 │   └── BandpassFilter.cs           # Legacy biquad bandpass (not in active pipeline)
 │
 ├── Decoder/
@@ -583,7 +580,7 @@ You maintain instruments in a calibration lab with no internet access. A shortwa
 4. Select "WWV — Fort Collins, Colorado, USA"
 5. Click Start Listening
 6. Watch the 100 Hz Level bar — it should show signal within seconds
-7. Wait ~2 minutes for 2 consecutive valid frames (Confidence 2/2)
+7. Wait ~4 minutes for Confidence 3/3 (hours and minutes confirmed by 3 consecutive Markov-verified increments)
 8. Click "Set Clock" to synchronize Windows time to UTC
 ```
 
@@ -653,7 +650,7 @@ In a secure facility with no network connectivity, system clocks drift over time
 2. Set receiver: AM mode, best-propagating frequency for your location and time of day
 3. Route audio to the target PC via line-in
 4. Run WwvDecoder as Administrator
-5. After achieving lock (Confidence 2/2), use "Set Clock" to correct drift
+5. After achieving lock (Confidence 3/3), use "Set Clock" to correct drift
 6. Check the log for the applied delta to track drift rate over time
 ```
 
@@ -689,8 +686,9 @@ For a classroom or ham radio club demonstration of how atomic time is distribute
 | Stuck on "Syncing" — countdown resets every ~10 s | Progressive marker check failing | Signal misaligned; decoder bails within 10 s and retries |
 | Countdown runs to 0 but no lock | Reserved bits or markers failing | Signal too noisy for reliable frame alignment; let it run or try a different frequency |
 | Decodes but time is wrong | Recording from a different date | Expected for old recordings — the encoded time is when it was recorded |
-| Log shows "Clock mismatch" | Frame re-anchored after a fade | Decoder detected misalignment and will self-correct within 1–2 frames |
-| "Set Clock" button grayed out | Fewer than 2 consecutive valid frames | Wait for Confidence to reach 2/2 (~2 minutes from cold start) |
+| Log shows "Clock mismatch … rejected" | Decoded time inconsistent with prior frame | Decoder rejected the frame and will re-verify; corrects automatically within 1–2 frames if the signal is stable |
+| Hours show `--:--:--` after first decode | Markov verification threshold not yet reached | Wait for Confidence to reach 3/3 (~4 minutes from cold start) |
+| "Set Clock" button grayed out | Confidence below 3/3 | Wait for Confidence to reach 3/3 — hours/minutes must be Markov-verified before clock set is enabled |
 | App requires Administrator | Needed for SetSystemTime() | Right-click → Run as Administrator |
 | Crash on start | Missing .NET 9 runtime | Use the self-contained published build, or install .NET 9 |
 
