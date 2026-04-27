@@ -929,8 +929,9 @@ public class FrameDecoder
         // Update per-bit accumulator from this frame's 100 Hz pulse measurements.
         // Confident bits (classifiers agreed, not fade-zeroed) push the accumulator
         // toward ±1 with strength proportional to the matched-filter confidence.
-        // Erasures apply a slow decay (×0.90) so evidence from clean frames persists
-        // through several subsequent faded minutes before falling below the vote threshold.
+        // Erasures apply a slow decay (×15/16) matching the NIST d=16 comb filter rate so
+        // evidence from clean frames persists through multi-minute fades before falling below
+        // the vote threshold (half-life ≈ 11 min vs ≈ 7 min with the old ×0.90 rate).
         for (int i = 0; i < 60; i++)
         {
             if (IsExpectedMarkerPosition(i) || IsReservedPosition(i)) continue;
@@ -950,7 +951,7 @@ public class FrameDecoder
             }
             else
             {
-                _bitAccumulator[i] *= 0.90; // slow decay toward 0 on erasure
+                _bitAccumulator[i] *= (15.0 / 16.0); // slow decay — NIST d=16 rate
             }
         }
 
