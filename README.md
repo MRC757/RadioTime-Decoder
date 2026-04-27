@@ -22,7 +22,7 @@ Built with WPF (.NET 9) and the MVVM pattern. Dark-themed UI with real-time sign
 - **Ionospheric fade detection** — `IsFading` flag correctly triggers when the envelope drops below 15% of the stable carrier reference for > 200 ms; fade-corrupted pulses receive zero confidence weight so they cannot corrupt the per-bit accumulator
 - **Per-bit accumulation voting** (NTP driver 36 §3.2) — each of the 60 bit positions carries a signed evidence score (positive = One, negative = Zero) updated with an exponential moving average each minute; confident measurements push the score toward ±1; erasures apply a slow 0.90 decay so clean-frame evidence persists through several faded minutes; the vote threshold is ±0.15, below which the persistent store or structure default wins
 - **Three-point bipolar discriminator** (NTP driver 36 §5) — after each 1000 Hz second tick the 100 Hz envelope is sampled at ~350 ms and ~650 ms after the tick; HIGH at 350 ms → Zero; LOW then HIGH at 650 ms → One; both LOW → erasure; this classifies bits from the carrier's return timing without relying on threshold crossings, which fail during HF fades that extend past the LOW period
-- **Persistent slow-bit carry-over** — day-of-year, year, DUT1, DST, and leap-second positions (27 out of 60) are retained from the last successfully validated frame and used to fill those positions in subsequent partial frames, since they change at most once per day; only minutes and hours (which change every minute) require fresh collection each frame
+- **Persistent slow-bit carry-over** — day-of-year, year, DUT1, DST, and leap-second positions (25 out of 60) are retained from the last successfully validated frame and used to fill those positions in subsequent partial frames, since they change at most once per day; only minutes and hours (which change every minute) require fresh collection each frame
 - **Operator UTC date hint** — the operator can enter today's UTC date (yyyy-MM-dd) before or during listening; the decoder immediately pre-fills the 18 DOY and year bit positions, reducing the number of bits that must be received from 60 to ~13 under poor propagation; the hint is overwritten automatically by the first successful frame decode
 - **P0→P1 gap confirmation** — when only the 100 Hz channel is available, validates the unique 9-second gap between P0 and P1 before anchoring, preventing the reset loop caused by marker-length noise during deep fades
 - **Marker saturation gate** — detects deep ionospheric fades (>60% Marker rate in the last 20 pulses) and pauses anchor attempts until the signal recovers
@@ -237,7 +237,7 @@ A complete frame spans 60 seconds (one bit per second, one frame per minute) and
 - DST status (US daylight saving time)
 - Leap-second pending flag
 
-Position markers appear at seconds 0, 9, 19, 29, 39, 49, and 59 to frame the time code. Specific bit positions are reserved and always transmitted as 0 by WWV.
+Position markers appear at seconds 0, 9, 19, 29, 39, 49, and 59 to frame the time code. Specific bit positions are unused and always transmitted as 0 by WWV (positions 1, 8, 14, 18, 24, 27, 28, 34, 42–48).
 
 ---
 
@@ -331,9 +331,9 @@ Audio In (22,050 Hz, 16-bit mono, 50 ms blocks)
 [11] BCD Decoder + Validation
     │  Checks all 7 position markers at positions 0, 9, 19, 29, 39, 49, 59
     │  Rejects frames with >12 total markers (>5 spurious) — indicates heavy corruption
-    │  Validates 13 reserved bit positions (always 0 in a clean transmission)
+    │  Validates 15 unused bit positions (always 0 in a clean transmission)
     │  Decodes BCD fields: minutes, hours, day-of-year, year, DUT1 sign/magnitude
-    │  Sanity checks: minutes ≤59, hours ≤23, doy 1–366, year ≤99, DUT1 magnitude ≤9
+    │  Sanity checks: minutes ≤59, hours ≤23, doy 1–366, year ≤99, DUT1 magnitude ≤0.7 s
     │
     │  Markov clock validation: compares decoded time to expected (prior + 1 min).
     │   Drift >30 s logged as possible frame misalignment.
@@ -493,8 +493,8 @@ The decoder applies four validation layers in order:
 
 1. **Marker positions** — all 7 position markers (P0, P1, P2, P3, P4, P5, P59) must be present at the expected bit positions: 0, 9, 19, 29, 39, 49, 59.
 2. **Spurious marker count** — more than 12 total markers (7 expected + 5 spurious) indicates heavy signal corruption and the frame is rejected rather than decoded to a wrong time.
-3. **Reserved bits** — WWV always transmits 0 at positions 5, 10, 11, 16, 20, 21, 26, 32, 35, 38, 44, 54, and 58. A non-zero reserved bit means the frame is misaligned or corrupted.
-4. **BCD range checks** — decoded values are checked: minutes ≤ 59, hours ≤ 23, day-of-year 1–366, year ≤ 99, DUT1 magnitude ≤ 9.
+3. **Unused bits** — WWV always transmits 0 at positions 1, 8, 14, 18, 24, 27, 28, 34, and 42–48. A non-zero value at these positions means the frame is misaligned or corrupted.
+4. **BCD range checks** — decoded values are checked: minutes ≤ 59, hours ≤ 23, day-of-year 1–366, year ≤ 99, DUT1 magnitude ≤ 0.7 s.
 
 All four must pass for a frame to produce a `TimeFrame` result.
 

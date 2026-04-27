@@ -3,42 +3,38 @@ namespace WwvDecoder.Decoder;
 /// <summary>
 /// Decodes BCD time fields from the 60-bit WWV frame buffer.
 ///
-/// WWV BCD frame layout (bit positions, seconds 0–59).
-/// Markers occur every 10 seconds. BCD digits are LSB-first (units before tens).
+/// WWV IRIG-H time code format (NIST), bit positions = second numbers 0–59.
+/// All BCD fields are LSB-first (units before tens).
 ///
 ///   Pos  0     = P0  reference marker
-///   Pos  1– 4  = Minutes units  (1, 2, 4, 8)
-///   Pos  5     = reserved (0)
-///   Pos  6– 8  = Minutes tens   (10, 20, 40)
+///   Pos  1     = unused (0)
+///   Pos  2     = DST1  (DST in effect today at 00:00 UTC)
+///   Pos  3     = LSW   (leap-second warning — pending at end of month)
+///   Pos  4– 7  = Year units      (1, 2, 4, 8)
+///   Pos  8     = unused (0)
 ///   Pos  9     = P1  marker
-///   Pos 10–11  = reserved (0)
-///   Pos 12–15  = Hours units    (1, 2, 4, 8)
-///   Pos 16     = reserved (0)
-///   Pos 17–18  = Hours tens     (10, 20)
+///   Pos 10–13  = Minutes units   (1, 2, 4, 8)
+///   Pos 14     = unused (0)
+///   Pos 15–17  = Minutes tens    (10, 20, 40)
+///   Pos 18     = unused (0)
 ///   Pos 19     = P2  marker
-///   Pos 20–21  = reserved (0)
-///   Pos 22–25  = Day units      (1, 2, 4, 8)
-///   Pos 26     = reserved (0)
-///   Pos 27–28  = Day tens       (10, 20)
+///   Pos 20–23  = Hours units     (1, 2, 4, 8)
+///   Pos 24     = unused (0)
+///   Pos 25–26  = Hours tens      (10, 20)
+///   Pos 27–28  = unused (0)
 ///   Pos 29     = P3  marker
-///   Pos 30–31  = Day tens cont  (40, 80)
-///   Pos 32     = reserved (0)
-///   Pos 33–34  = Day hundreds   (100, 200)
-///   Pos 35     = reserved (0)
-///   Pos 36–37  = DUT1 sign (+, -)
-///   Pos 38     = reserved (0)
+///   Pos 30–33  = DOY units       (1, 2, 4, 8)
+///   Pos 34     = unused (0)
+///   Pos 35–38  = DOY tens        (10, 20, 40, 80)
 ///   Pos 39     = P4  marker
-///   Pos 40–43  = DUT1 magnitude (1, 2, 4, 8) × 0.1 s
-///   Pos 44     = reserved (0)
-///   Pos 45–48  = Year units     (1, 2, 4, 8)
+///   Pos 40–41  = DOY hundreds    (100, 200)
+///   Pos 42–48  = unused (0)
 ///   Pos 49     = P5  marker
-///   Pos 50–53  = Year tens      (10, 20, 40, 80)
-///   Pos 54     = reserved (0)
-///   Pos 55     = Leap second warning
-///   Pos 56     = DST bit 1
-///   Pos 57     = DST bit 2
-///   Pos 58     = reserved (0)
-///   Pos 59     = P0  next frame reference marker
+///   Pos 50     = DUT1 sign       (1 = positive, 0 = negative)
+///   Pos 51–54  = Year tens       (10, 20, 40, 80)
+///   Pos 55     = DST2  (DST in effect tomorrow at 24:00 UTC)
+///   Pos 56–58  = DUT1 magnitude  (0.1, 0.2, 0.4 s; max = 0.7 s)
+///   Pos 59     = P0  next-frame reference marker
 /// </summary>
 public static class BcdDecoder
 {
@@ -62,29 +58,29 @@ public static class BcdDecoder
             if (bits[i] == 2) totalMarkers++;
         if (totalMarkers > 12) return null;
 
-        // Validate reserved bit positions — WWV transmits 0 at these positions.
+        // Validate unused bit positions — WWV transmits 0 at these positions.
         // Any non-zero value indicates signal corruption or wrong frame alignment.
-        ReadOnlySpan<int> reserved = [5, 10, 11, 16, 20, 21, 26, 32, 35, 38, 44, 54, 58];
-        foreach (int r in reserved)
+        ReadOnlySpan<int> unused = [1, 8, 14, 18, 24, 27, 28, 34, 42, 43, 44, 45, 46, 47, 48];
+        foreach (int r in unused)
             if (bits[r] != 0) return null;
 
-        int minutes = DecodeBcd(bits, [1, 2, 3, 4, 6, 7, 8]);          // skip pos 5
-        int hours   = DecodeBcd(bits, [12, 13, 14, 15, 17, 18]);       // skip pos 16
-        int doy     = DecodeBcd(bits, [22, 23, 24, 25, 27, 28, 30, 31, 33, 34]); // skip 26, 32; P3@29
-        int year    = DecodeBcd(bits, [45, 46, 47, 48, 50, 51, 52, 53]); // P5@49
+        int minutes = DecodeBcd(bits, [10, 11, 12, 13, 15, 16, 17]);              // skip pos 14
+        int hours   = DecodeBcd(bits, [20, 21, 22, 23, 25, 26]);                  // skip pos 24
+        int doy     = DecodeBcd(bits, [30, 31, 32, 33, 35, 36, 37, 38, 40, 41]); // skip 34; P4@39
+        int year    = DecodeBcd(bits, [4, 5, 6, 7, 51, 52, 53, 54]);              // units 4–7, tens 51–54
 
         // Sanity checks — year is 2-digit BCD (0–99)
         if (minutes > 59 || hours > 23 || doy < 1 || doy > 366 || year > 99) return null;
 
-        // DUT1: sign bits 36–37, magnitude bits 40–43
-        // Bit 36 = positive, bit 37 = negative. Magnitude is 0–9 (×0.1 s).
-        double dut1Sign = bits[36] == 1 ? +1.0 : bits[37] == 1 ? -1.0 : 0.0;
-        int dut1Magnitude = DecodeBcd(bits, [40, 41, 42, 43]);
-        if (dut1Magnitude > 9) return null; // invalid BCD digit
-        double dut1 = dut1Sign * dut1Magnitude * 0.1;
+        // DUT1: sign bit 50 (1=positive, 0=negative), magnitude bits 56–58 (0.1, 0.2, 0.4 s)
+        double dut1Sign      = bits[50] == 1 ? +1.0 : -1.0;
+        double dut1Magnitude = (bits[56] == 1 ? 0.1 : 0.0)
+                             + (bits[57] == 1 ? 0.2 : 0.0)
+                             + (bits[58] == 1 ? 0.4 : 0.0);
+        double dut1 = dut1Sign * dut1Magnitude;
 
-        bool leapPending = bits[55] == 1;
-        bool dstActive   = bits[56] == 1 || bits[57] == 1;
+        bool leapPending = bits[3]  == 1;
+        bool dstActive   = bits[2]  == 1 || bits[55] == 1;
 
         // Build UTC DateTime from year/doy/hours/minutes
         int fullYear = 2000 + year;

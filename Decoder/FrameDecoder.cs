@@ -32,14 +32,16 @@ public class FrameDecoder
     //
     // Updated only from successfully BCD-validated frames (not from raw voted guesses).
     // Survives Reset() so a decoder restart during the same minute reuses the prior data.
-    // Positions: DOY units/tens/hundreds (22-34), DUT1 (36-37, 40-43),
-    //            year units/tens (45-53), leap/DST (55-57).
+    // Positions: DST1/leap (2-3), year units (4-7), DOY (30-41), DUT1 sign (50),
+    //            year tens (51-54), DST2 (55), DUT1 magnitude (56-58).
     // Value of -1 = not yet observed.
     private static readonly int[] SlowBitPositions =
-        [22, 23, 24, 25, 27, 28, 30, 31, 33, 34,  // day of year
-         36, 37, 40, 41, 42, 43,                   // DUT1 sign + magnitude
-         45, 46, 47, 48, 50, 51, 52, 53,           // year
-         55, 56, 57];                               // leap second warning, DST
+        [2, 3,                                     // DST1, leap second warning
+         4, 5, 6, 7,                               // year units
+         30, 31, 32, 33, 35, 36, 37, 38, 40, 41,  // day of year
+         50,                                       // DUT1 sign
+         51, 52, 53, 54,                           // year tens
+         55, 56, 57, 58];                          // DST2, DUT1 magnitude
     private readonly int[] _persistentBits = Enumerable.Repeat(-1, 60).ToArray();
 
     // Operator-supplied (or auto-seeded) UTC date hint.
@@ -1038,8 +1040,8 @@ public class FrameDecoder
                 // The persistent store year/DOY bits are clearly stale — wipe them so
                 // subsequent frames fall back to the auto-seeded value rather than
                 // perpetuating the wrong year on every frame.
-                foreach (int pos in (int[])[45, 46, 47, 48, 50, 51, 52, 53,   // year
-                                            22, 23, 24, 25, 27, 28, 30, 31, 33, 34]) // DOY
+                foreach (int pos in (int[])[4, 5, 6, 7, 51, 52, 53, 54,             // year
+                                            30, 31, 32, 33, 35, 36, 37, 38, 40, 41]) // DOY
                     _persistentBits[pos] = -1;
 
                 // Re-seed from the known date so the next frame has a correct year/DOY
@@ -1050,10 +1052,8 @@ public class FrameDecoder
                 // store so the next frame starts from a known value rather than zero.
                 // Starting at zero allows a single measurement to immediately exceed the 0.15
                 // threshold; seeding to ±0.4 means incoming evidence must overcome real resistance.
-                // DOY was previously missing from this clear — that was a bug causing DOY to
-                // stay locked to the old wrong value even after year was cleared and re-seeded.
-                int[] yearDoyPositions = [45, 46, 47, 48, 50, 51, 52, 53,           // year
-                                          22, 23, 24, 25, 27, 28, 30, 31, 33, 34];  // DOY
+                int[] yearDoyPositions = [4, 5, 6, 7, 51, 52, 53, 54,             // year
+                                          30, 31, 32, 33, 35, 36, 37, 38, 40, 41];  // DOY
                 foreach (int pos in yearDoyPositions)
                     _bitAccumulator[pos] = _persistentBits[pos] >= 0
                         ? (_persistentBits[pos] == 1 ? 0.4 : -0.4)
@@ -1435,7 +1435,7 @@ public class FrameDecoder
 
     // WWV always transmits 0 at these positions — any non-zero value is structural noise.
     private static bool IsReservedPosition(int pos) =>
-        pos is 5 or 10 or 11 or 16 or 20 or 21 or 26 or 32 or 35 or 38 or 44 or 54 or 58;
+        pos is 1 or 8 or 14 or 18 or 24 or 27 or 28 or 34 or 42 or 43 or 44 or 45 or 46 or 47 or 48;
 
     /// <summary>
     /// Builds a snapshot of the current 60-bit frame state and fires the visualization
@@ -1485,9 +1485,9 @@ public class FrameDecoder
         int year = utcDate.Year % 100;   // WWV encodes a 2-digit year (00–99)
         int doy  = utcDate.DayOfYear;
 
-        EncodeIntoPersistentBits(year, [45, 46, 47, 48, 50, 51, 52, 53],
+        EncodeIntoPersistentBits(year, [4, 5, 6, 7, 51, 52, 53, 54],
                                        [1, 2, 4, 8, 10, 20, 40, 80]);
-        EncodeIntoPersistentBits(doy,  [22, 23, 24, 25, 27, 28, 30, 31, 33, 34],
+        EncodeIntoPersistentBits(doy,  [30, 31, 32, 33, 35, 36, 37, 38, 40, 41],
                                        [1, 2, 4, 8, 10, 20, 40, 80, 100, 200]);
 
         _knownDateUtc = utcDate.Date;
@@ -1497,8 +1497,8 @@ public class FrameDecoder
         // incoming measurement (weight ~0.9 → alpha 0.10 → shift +0.09) stays below the
         // 0.15 threshold — but only barely. Seeding to ±0.4 gives a comfortable margin so
         // the live signal must accumulate several consistent frames before overriding the hint.
-        foreach (int pos in (int[])[45, 46, 47, 48, 50, 51, 52, 53,           // year
-                                    22, 23, 24, 25, 27, 28, 30, 31, 33, 34])  // DOY
+        foreach (int pos in (int[])[4, 5, 6, 7, 51, 52, 53, 54,             // year
+                                    30, 31, 32, 33, 35, 36, 37, 38, 40, 41])  // DOY
             _bitAccumulator[pos] = _persistentBits[pos] == 1 ? 0.4 : -0.4;
 
         _onLog?.Invoke($"Operator date applied: {utcDate:yyyy-MM-dd} UTC  " +
@@ -1511,8 +1511,8 @@ public class FrameDecoder
     /// </summary>
     public void ClearKnownDate()
     {
-        int[] datePositions = [22, 23, 24, 25, 27, 28, 30, 31, 33, 34,   // DOY
-                                45, 46, 47, 48, 50, 51, 52, 53];          // year
+        int[] datePositions = [30, 31, 32, 33, 35, 36, 37, 38, 40, 41,   // DOY
+                                4, 5, 6, 7, 51, 52, 53, 54];              // year
         foreach (int pos in datePositions)
             _persistentBits[pos] = -1;
         _knownDateUtc = null;
@@ -1613,14 +1613,14 @@ public class FrameDecoder
         // maxValue is the maximum valid SUM from that group's bits.
         (int[] positions, int[] weights, int max)[] groups =
         [
-            ([1,  2,  3,  4 ], [1,  2,  4, 8 ],  9),  // minutes units  0–9
-            ([6,  7,  8      ], [10, 20, 40    ], 50),  // minutes tens   0–50 (digit 0–5)
-            ([12, 13, 14, 15], [1,  2,  4, 8 ],  9),  // hours units    0–9
-            ([17, 18         ], [10, 20        ], 20),  // hours tens     0–20 (digit 0–2)
-            ([22, 23, 24, 25], [1,  2,  4, 8 ],  9),  // DOY units      0–9
-            ([27, 28, 30, 31], [10, 20, 40, 80], 90),  // DOY tens       0–90 (digit 0–9)
-            ([45, 46, 47, 48], [1,  2,  4, 8 ],  9),  // year units     0–9
-            ([50, 51, 52, 53], [10, 20, 40, 80], 90),  // year tens      0–90 (digit 0–9)
+            ([10, 11, 12, 13], [1,  2,  4, 8 ],  9),  // minutes units  0–9
+            ([15, 16, 17     ], [10, 20, 40    ], 50),  // minutes tens   0–50 (digit 0–5)
+            ([20, 21, 22, 23], [1,  2,  4, 8 ],  9),  // hours units    0–9
+            ([25, 26         ], [10, 20        ], 20),  // hours tens     0–20 (digit 0–2)
+            ([30, 31, 32, 33], [1,  2,  4, 8 ],  9),  // DOY units      0–9
+            ([35, 36, 37, 38], [10, 20, 40, 80], 90),  // DOY tens       0–90 (digit 0–9)
+            ([4,  5,  6,  7 ], [1,  2,  4, 8 ],  9),  // year units     0–9
+            ([51, 52, 53, 54], [10, 20, 40, 80], 90),  // year tens      0–90 (digit 0–9)
         ];
 
         foreach (var (positions, weights, max) in groups)
