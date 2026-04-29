@@ -62,10 +62,11 @@ public class FrameDecoder
     // Cleared only by a full Reset() (user-initiated decoder restart).
     private readonly double[] _bitAccumulator = new double[60];
 
-    // Three-point bipolar discriminator state (NTP driver 36 §5).
+    // Three-point bipolar discriminator state.
     // After each 1000 Hz second tick at position N, schedule envelope samples at
     // ~350 ms (between the Zero/One transition) and ~650 ms (between One/Marker).
-    // Carrier HIGH at 350 ms → Zero.  HIGH only at 650 ms → One.  Both LOW → erasure.
+    // Both LOW at 350 ms and 650 ms → Zero.  HIGH at 350 ms + LOW at 650 ms → One.
+    // Both HIGH → Marker (erasure — handled by 100 Hz channel).  Inverted case → erasure.
     // This classifies the bit WITHOUT relying on carrier return-to-threshold detection,
     // which fails completely during HF fades that extend past the LOW period.
     private long   _envTickTimestamp = 0;   // Stopwatch timestamp of triggering tick
@@ -91,9 +92,14 @@ public class FrameDecoder
     private int _frameTotal;
 
     // Clock advance prediction (Markov validation from Mills' driver 36):
-    // after a successful decode, advance 1 minute and compare against the next
-    // decode. Mismatch > 30 s indicates the frame decoder has drifted or re-aligned.
-    private DateTime? _clockExpected;
+    // After a confirmed decode, record the decoded UTC time and the system wall-clock
+    // time (DateTime.UtcNow). Each subsequent frame computes the expected time as
+    //   decoded_anchor + round(DateTime.UtcNow - wall_anchor)
+    // rather than advancing a counter by one minute per TryDecode call. This bounds
+    // drift to the accuracy of the system clock even when many frames are missed
+    // entirely (no TryDecode fires) during propagation outages.
+    private DateTime? _clockWallAnchor;    // DateTime.UtcNow when anchor was established
+    private DateTime? _clockDecodedAnchor; // frame.UtcTime corresponding to wall anchor
     private int _clockVerifiedCount;
 
     // P0→P1 gap confirmation — require a confirmed 9-second inter-marker gap before
@@ -253,7 +259,8 @@ public class FrameDecoder
         _envGotA          = false;
         _frameHits = 0;
         _frameTotal = 0;
-        _clockExpected = null;
+        _clockWallAnchor    = null;
+        _clockDecodedAnchor = null;
         _clockVerifiedCount = 0;
         _candidateAnchorTick    = 0;
         _candidateP0OffsetSeconds = 0;
@@ -508,8 +515,9 @@ public class FrameDecoder
                         {
                             // Confirmed P0→P1: the unique 9-second gap at the top of each minute.
                             // Fill seconds-field bits 1-8 as gap-filled (not confident), confirm
-                            // both markers, and enter SYNCING starting at position 10.
-                            _bits[0] = 2; _bitConfident[0] = true;
+                            // P1 marker, and enter SYNCING starting at position 10.
+                            // Bit 0 = HOLE (Pr): reserved, no 100 Hz pulse — always 0.
+                            _bits[0] = 0; _bitConfident[0] = true;
                             for (int i = 1; i <= 8; i++)
                             {
                                 _bits[i] = 0;
@@ -743,8 +751,11 @@ public class FrameDecoder
         // (PulseDetector runs before TickDetector in DecoderPipeline.ProcessSamples).
         // If bitIndex==1 and bits[0]==2, the 100 Hz channel already correctly anchored P0.
         // Just confirm and boost lock quality — no re-anchor needed.
+        // Already anchored at this minute boundary if we just started collecting (bitIndex=1)
+        // and a wall-clock anchor is set — means a prior event (100 Hz P0 or MinutePulse)
+        // already established the second-0 epoch. Bit 0 is now the HOLE (0), not a Marker.
         bool alreadyAtP0 = (_state == State.Syncing || _state == State.Locked)
-                           && _bitIndex == 1 && _bits[0] == 2;
+                           && _bitIndex == 1 && _anchorWallTick != 0;
         if (alreadyAtP0)
         {
             _lockQuality = Math.Min(1.0, _lockQuality + 0.10);
@@ -780,9 +791,9 @@ public class FrameDecoder
         Array.Clear(_bitWeight,    0, 60);
         Array.Clear(_bitGapFilled, 0, 60);
         Array.Clear(_bitCorrected, 0, 60);
-        _bits[0]         = 2;
+        _bits[0]         = 0;   // HOLE (Pr): no 100 Hz pulse at second 0 — always 0
         _bitConfident[0] = true;
-        _bitWeight[0]    = 1.0; // P0 marker is certain
+        _bitWeight[0]    = 0.0; // reserved position — excluded from voting
         _bitIndex = 1;
         _frameHits = 1;
         _frameTotal = 1;
@@ -960,6 +971,9 @@ public class FrameDecoder
         _frameHits = 0; _frameTotal = 0;
 
         // Produce voted bit array from per-bit accumulator + persistent store fallback.
+        // DIAG: log key accumulator values
+        _onLog?.Invoke($"[DIAG] acc[38]={_bitAccumulator[38]:F4} acc[4]={_bitAccumulator[4]:F4} acc[51]={_bitAccumulator[51]:F4} acc[52]={_bitAccumulator[52]:F4}");
+        _onLog?.Invoke($"[DIAG] acc[30]={_bitAccumulator[30]:F4} acc[31]={_bitAccumulator[31]:F4} acc[32]={_bitAccumulator[32]:F4} acc[40]={_bitAccumulator[40]:F4}");
         var (votedBits, persistFallbacks, structFallbacks, minMargin, minMarginPos) = VoteBits();
 
         // Dump the full 60-bit frame for diagnostics (raw, then voted).
@@ -996,7 +1010,7 @@ public class FrameDecoder
                 if (votedBits[i] == 2) markers.Add(i);
             int spurious = markers.Count(p => !IsExpectedMarkerPosition(p));
             string spuriousNote = spurious > 0 ? $"  ({spurious} spurious)" : string.Empty;
-            _onLog($"Markers at: [{string.Join(", ", markers)}]  (expected: 0,9,19,29,39,49,59){spuriousNote}");
+            _onLog($"Markers at: [{string.Join(", ", markers)}]  (expected: 9,19,29,39,49,59){spuriousNote}");
 
             var segErased = new int[6];
             for (int i = 0; i < 60; i++)
@@ -1010,11 +1024,15 @@ public class FrameDecoder
                        $"(|acc|>0.5 solid, <0.15 marginal)");
         }
 
-        // BCD-constrained post-processing: verify each BCD digit group is in its valid range
-        // and correct single-bit overflows by clearing the highest-weight contributing bit.
-        // This catches cases where a marginal high-weight vote flips a digit from 5→6 (minutes
-        // tens), 2→3 (hours tens), or 9→10+ (any units group) — invalid BCD that BcdDecoder
-        // would reject outright, but recoverable with one bit correction.
+        // Soft BCD scoring: for each BCD field, enumerate all structurally valid values
+        // and score each against the raw accumulator. The highest-scoring valid value
+        // replaces the threshold-based vote for that field. This resolves borderline bits
+        // toward the nearest valid BCD value using the full soft evidence rather than
+        // hard thresholding each bit independently.
+        ApplySoftBcdScoring(votedBits);
+
+        // BCD-constrained post-processing: catches any remaining out-of-range digit after
+        // soft scoring (should be rare now, but kept as a safety net).
         int bcdCorrections = ApplyBcdConstraints(votedBits);
         if (bcdCorrections > 0)
             _onLog?.Invoke($"BCD constraints: {bcdCorrections} bit(s) corrected");
@@ -1066,62 +1084,91 @@ public class FrameDecoder
 
         if (frame != null)
         {
+            // BCD decode succeeded and date gate passed — slow fields (date, DOY, DUT1,
+            // DST, leap) are structurally valid regardless of whether the Markov clock
+            // check passes. Flag them so the UI can display date data immediately.
+            frame.SlowFieldsConfident = true;
+
             // Clock advance prediction (Markov validation from NTP driver 36):
-            // compare decoded time against the expected time advanced from the
-            // prior successful decode. A drift > 30 s means framing has slipped.
-            if (_clockExpected.HasValue)
+            // compare decoded time against the expected time derived from real wall-clock
+            // elapsed since the last confirmed decode. Expected = decoded_anchor +
+            // round(DateTime.UtcNow - wall_anchor). Using real elapsed time rather than
+            // a per-frame counter prevents drift escalation when frames are missed entirely
+            // during propagation outages — expected always tracks real elapsed minutes.
+            bool markovPassed = false;
+            if (_clockWallAnchor.HasValue)
             {
-                double drift = (frame.UtcTime - _clockExpected.Value).TotalSeconds;
+                var elapsed = DateTime.UtcNow - _clockWallAnchor.Value;
+                int minutesElapsed = (int)Math.Round(elapsed.TotalMinutes);
+                var expected = _clockDecodedAnchor!.Value.AddMinutes(minutesElapsed);
+
+                double drift = (frame.UtcTime - expected).TotalSeconds;
                 if (Math.Abs(drift) <= 30.0)
                 {
                     _clockVerifiedCount++;
+                    markovPassed = true;
                     _onLog?.Invoke($"Verified #{_clockVerifiedCount}: {frame.UtcTime:HH:mm} " +
-                                   $"(drift {drift:+0.0;-0.0}s from expected)");
-                    _clockExpected = frame.UtcTime.AddMinutes(1);
+                                   $"(drift {drift:+0.0;-0.0}s from expected {expected:HH:mm})");
+                    _clockWallAnchor    = DateTime.UtcNow;
+                    _clockDecodedAnchor = frame.UtcTime;
                 }
                 else
                 {
-                    // Reject the frame: the decoded time is inconsistent with the
-                    // established timeline. Advance _clockExpected by one minute based
-                    // on the last good prediction so subsequent frames continue to be
-                    // checked against the correct timeline rather than the wrong decoded time.
-                    _onLog?.Invoke($"Clock mismatch: expected {_clockExpected.Value:HH:mm} " +
+                    _onLog?.Invoke($"Clock mismatch: expected {expected:HH:mm} " +
                                    $"got {frame.UtcTime:HH:mm} (drift {drift:+0.0;-0.0}s) — rejected");
                     _clockVerifiedCount = 0;
-                    _clockExpected = _clockExpected.Value.AddMinutes(1);
-                    frame = null;
                 }
             }
             else
             {
-                // First decode — no prior reference. Accept unconditionally and
-                // establish the baseline for subsequent Markov checks.
-                _clockExpected = frame.UtcTime.AddMinutes(1);
+                // First decode — establish wall-clock anchor. Accept unconditionally.
+                _clockWallAnchor    = DateTime.UtcNow;
+                _clockDecodedAnchor = frame.UtcTime;
+                markovPassed = true;
+                _clockVerifiedCount = 0; // anchor established; first Markov check is next frame
             }
 
-            // Update the persistent slow-bit store from this validated frame.
-            // Only slow-changing positions are stored (DOY, year, DUT1, DST, leap).
-            // Fast-changing positions (minutes, hours) are deliberately excluded so a
-            // stale persistent entry never supplies wrong time data.
-            foreach (int pos in SlowBitPositions)
-                _persistentBits[pos] = votedBits[pos];
+            if (markovPassed)
+            {
+                frame.HoursMinutesConfident = true;
 
-            // Advance the known date from the validated frame so the date gate
-            // stays current across midnight UTC and end-of-year boundaries.
-            _knownDateUtc = frame.UtcTime.Date;
+                // Update the persistent slow-bit store from this validated frame.
+                foreach (int pos in SlowBitPositions)
+                    _persistentBits[pos] = votedBits[pos];
 
-            _consecutiveValid++;
-            _consecutiveInvalid = 0;
-            _lockQuality = Math.Min(1.0, _lockQuality + 0.2);
+                // Advance the known date from the validated frame.
+                _knownDateUtc = frame.UtcTime.Date;
 
-            // ConfidenceFrames counts Markov-verified increments, not raw accepted frames.
-            // First-frame decodes have ConfidenceFrames=0; the count only rises after
-            // the second and subsequent frames each pass the drift-≤30s clock check.
-            // The UI gates the hours/minutes display on ConfidenceFrames >= 3.
-            frame.ConfidenceFrames = _clockVerifiedCount;
-            _latestFrame = frame;
-            _state = State.Locked;
+                _consecutiveValid++;
+                _consecutiveInvalid = 0;
+                _lockQuality = Math.Min(1.0, _lockQuality + 0.2);
 
+                // ConfidenceFrames counts Markov-verified increments, not raw accepted frames.
+                // First-frame decodes have ConfidenceFrames=0; the count only rises after
+                // the second and subsequent frames each pass the drift-≤30s clock check.
+                // The UI gates the hours/minutes display on ConfidenceFrames >= 2.
+                frame.ConfidenceFrames = _clockVerifiedCount;
+                _latestFrame = frame;
+                _state = State.Locked;
+
+                // Pre-seed hours/minutes accumulators for the next frame with the expected
+                // +1-minute value so marginal bits have a head start next decode cycle.
+                SeedNextFrameTimeAccumulators(frame.UtcTime);
+            }
+            else
+            {
+                _consecutiveInvalid++;
+                _consecutiveValid = 0;
+                _lockQuality = Math.Max(0, _lockQuality - 0.3);
+                if (_consecutiveInvalid >= 2)
+                {
+                    _state = State.Searching;
+                    _lockQuality = 0;
+                }
+            }
+
+            // Fire the frame callback in both cases. When Markov failed, only
+            // SlowFieldsConfident is set — the UI updates date/DOY but not time.
             _onFrameDecoded(frame);
         }
         else
@@ -1244,9 +1291,10 @@ public class FrameDecoder
     ///     sampleA @ ~350 ms: between the Zero (200 ms) and One (500 ms) LOW-period ends.
     ///     sampleB @ ~650 ms: between the One (500 ms) and Marker (800 ms) LOW-period ends.
     ///
-    ///   HIGH at 350 ms → Zero  (carrier already returned)
-    ///   LOW at 350 ms + HIGH at 650 ms → One  (carrier returned between 350–650 ms)
-    ///   Both LOW → erasure (Marker or fade — carrier still absent at 650 ms)
+    ///   Both LOW  (350 ms and 650 ms) → Zero  (HIGH period ended before 350 ms)
+    ///   HIGH at 350 ms + LOW at 650 ms → One  (HIGH period ended between 350–650 ms)
+    ///   Both HIGH → Marker erasure (handled by 100 Hz channel)
+    ///   LOW then HIGH (inverted) → erasure (multipath artefact)
     ///
     /// Updates _bitAccumulator[N] directly, providing independent evidence separate from
     /// the 100 Hz threshold-crossing measurement already done by PulseDetector.
@@ -1286,18 +1334,18 @@ public class FrameDecoder
             bool isProtectedSlowBit = SlowBitPositions.Contains(bitPos) && _persistentBits[bitPos] >= 0;
             double alpha = isProtectedSlowBit ? 0.10 : 0.50;
 
-            if (aHigh)
+            if (!aHigh && !bHigh)
             {
-                // Carrier HIGH at 350 ms → bit is Zero (carrier returned within 200 ms LOW)
+                // Both LOW → Zero (HIGH period ended before 350 ms — only 200 ms wide)
                 _bitAccumulator[bitPos] += alpha * (-1.0 - _bitAccumulator[bitPos]);
             }
-            else if (bHigh)
+            else if (aHigh && !bHigh)
             {
-                // Carrier LOW at 350 ms, HIGH at 650 ms → bit is One (500 ms LOW period)
+                // HIGH at 350 ms, LOW at 650 ms → One (HIGH period ended between 350–650 ms)
                 _bitAccumulator[bitPos] += alpha * (+1.0 - _bitAccumulator[bitPos]);
             }
-            // Both LOW → Marker or fade erasure — no accumulator update
-            // (the accumulator decays in TryDecode when the 100 Hz channel also erases it)
+            // aHigh && bHigh → Marker erasure (100 Hz channel handles this)
+            // !aHigh && bHigh → inverted/multipath erasure — no accumulator update
         }
     }
 
@@ -1416,7 +1464,8 @@ public class FrameDecoder
         Array.Clear(_bitCorrected, 0, 60);
         _frameHits = 0;
         _frameTotal = 0;
-        _clockExpected = null;
+        _clockWallAnchor    = null;
+        _clockDecodedAnchor = null;
         _clockVerifiedCount = 0;
         _candidateAnchorTick      = 0;
         _candidateP0OffsetSeconds = 0;
@@ -1432,11 +1481,12 @@ public class FrameDecoder
     }
 
     private static bool IsExpectedMarkerPosition(int pos) =>
-        pos is 0 or 9 or 19 or 29 or 39 or 49 or 59;
+        pos is 9 or 19 or 29 or 39 or 49 or 59;
 
     // WWV always transmits 0 at these positions — any non-zero value is structural noise.
+    // Pos 0 = frame reference hole (Pr): no 100 Hz pulse, not a position marker.
     private static bool IsReservedPosition(int pos) =>
-        pos is 1 or 8 or 14 or 18 or 24 or 27 or 28 or 34 or 42 or 43 or 44 or 45 or 46 or 47 or 48;
+        pos is 0 or 1 or 8 or 14 or 18 or 24 or 27 or 28 or 34 or 42 or 43 or 44 or 45 or 46 or 47 or 48;
 
     /// <summary>
     /// Builds a snapshot of the current 60-bit frame state and fires the visualization
@@ -1645,6 +1695,119 @@ public class FrameDecoder
         }
 
         return corrections;
+    }
+
+    // ── Soft BCD field scoring (Item 2) ──────────────────────────────────────
+    // For each BCD field, enumerate every structurally valid integer value and score
+    // each against the raw per-bit accumulators. Pick the highest-scoring valid value
+    // and write it back into votedBits. This handles the common case where one or two
+    // marginal bits have pushed the threshold-based vote into an invalid BCD value, or
+    // where a borderline bit should be resolved toward the nearest valid time field.
+    private void ApplySoftBcdScoring(int[] votedBits)
+    {
+        // Minutes: positions 10-13 (units 1,2,4,8), 15-17 (tens 10,20,40); valid 0-59
+        int[] minPos = [10, 11, 12, 13, 15, 16, 17];
+        int[] minWt  = [1,  2,  4,  8,  10, 20, 40];
+        EncodeBcdIntoVoted(votedBits, SoftDecodeBcdField(minPos, minWt, ValidMinutes()), minPos, minWt);
+
+        // Hours: positions 20-23 (units 1,2,4,8), 25-26 (tens 10,20); valid 0-23
+        int[] hrPos = [20, 21, 22, 23, 25, 26];
+        int[] hrWt  = [1,  2,  4,  8,  10, 20];
+        EncodeBcdIntoVoted(votedBits, SoftDecodeBcdField(hrPos, hrWt, ValidHours()), hrPos, hrWt);
+
+        // DOY: positions 30-33 (units), 35-38 (tens), 40-41 (hundreds); valid 1-366
+        int[] doyPos = [30, 31, 32, 33, 35, 36, 37, 38, 40, 41];
+        int[] doyWt  = [1,  2,  4,  8,  10, 20, 40, 80, 100, 200];
+        EncodeBcdIntoVoted(votedBits, SoftDecodeBcdField(doyPos, doyWt, ValidDoy()), doyPos, doyWt);
+
+        // Year: positions 4-7 (units 1,2,4,8), 51-54 (tens 10,20,40,80); valid 0-99
+        int[] yrPos = [4,  5,  6,  7,  51, 52, 53, 54];
+        int[] yrWt  = [1,  2,  4,  8,  10, 20, 40, 80];
+        EncodeBcdIntoVoted(votedBits, SoftDecodeBcdField(yrPos, yrWt, ValidYear()), yrPos, yrWt);
+    }
+
+    private static IEnumerable<int> ValidMinutes()
+    {
+        for (int t = 0; t <= 5; t++) for (int u = 0; u <= 9; u++) yield return t * 10 + u;
+    }
+
+    private static IEnumerable<int> ValidHours()
+    {
+        for (int t = 0; t <= 2; t++) for (int u = 0; u <= 9; u++) { int v = t * 10 + u; if (v <= 23) yield return v; }
+    }
+
+    private static IEnumerable<int> ValidDoy()
+    {
+        for (int h = 0; h <= 3; h++) for (int t = 0; t <= 9; t++) for (int u = 0; u <= 9; u++) { int v = h * 100 + t * 10 + u; if (v >= 1 && v <= 366) yield return v; }
+    }
+
+    private static IEnumerable<int> ValidYear()
+    {
+        for (int t = 0; t <= 9; t++) for (int u = 0; u <= 9; u++) yield return t * 10 + u;
+    }
+
+    private int SoftDecodeBcdField(int[] positions, int[] weights, IEnumerable<int> validValues)
+    {
+        int   bestValue = 0;
+        double bestScore = double.MinValue;
+        foreach (int v in validValues)
+        {
+            double score = ScoreBcdCandidate(v, positions, weights);
+            if (score > bestScore) { bestScore = score; bestValue = v; }
+        }
+        return bestValue;
+    }
+
+    private double ScoreBcdCandidate(int value, int[] positions, int[] weights)
+    {
+        double score = 0;
+        int remaining = value;
+        for (int i = positions.Length - 1; i >= 0; i--)
+        {
+            bool bitSet = remaining >= weights[i];
+            if (bitSet) remaining -= weights[i];
+            score += bitSet ? _bitAccumulator[positions[i]] : -_bitAccumulator[positions[i]];
+        }
+        return score;
+    }
+
+    private static void EncodeBcdIntoVoted(int[] voted, int value, int[] positions, int[] weights)
+    {
+        int remaining = value;
+        for (int i = positions.Length - 1; i >= 0; i--)
+        {
+            bool bitSet = remaining >= weights[i];
+            if (bitSet) remaining -= weights[i];
+            voted[positions[i]] = bitSet ? 1 : 0;
+        }
+    }
+
+    // ── Cross-frame hours/minutes accumulator seeding (Item 3) ───────────────
+    // After each Markov-verified frame, pre-seed the hours and minutes bit
+    // accumulators with the expected value for the NEXT frame (+1 minute).
+    // Only positions where |acc| < vote threshold are seeded — strong existing
+    // evidence is preserved. This gives the next frame a head start equivalent
+    // to the DOY/year persistent-store seeding for slow fields.
+    private void SeedNextFrameTimeAccumulators(DateTime verifiedUtc)
+    {
+        var next = verifiedUtc.AddMinutes(1);
+        SeedAccumulatorField(next.Minute, [10, 11, 12, 13, 15, 16, 17], [1, 2, 4, 8, 10, 20, 40]);
+        SeedAccumulatorField(next.Hour,   [20, 21, 22, 23, 25, 26],      [1, 2, 4, 8, 10, 20]);
+    }
+
+    private void SeedAccumulatorField(int value, int[] positions, int[] weights)
+    {
+        const double SeedStrength = 0.40;
+        const double SeedThreshold = 0.15;
+        int remaining = value;
+        for (int i = positions.Length - 1; i >= 0; i--)
+        {
+            bool bitSet = remaining >= weights[i];
+            if (bitSet) remaining -= weights[i];
+            // Seed only positions where the accumulator has no strong opinion yet.
+            if (Math.Abs(_bitAccumulator[positions[i]]) < SeedThreshold)
+                _bitAccumulator[positions[i]] = bitSet ? SeedStrength : -SeedStrength;
+        }
     }
 
     private static double TicksToSeconds(long ticks) =>

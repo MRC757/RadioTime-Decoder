@@ -27,6 +27,11 @@ public class InputAgc
 
     private double _level = MinLevel;
 
+    // Snapshot of _level taken at the most recent SecondTick.  Used by BeginFastRecovery()
+    // to restore the pre-minute-pulse gain rather than resetting all the way to 1×.
+    private double _levelSnapshot = MinLevel;
+    private bool   _hasSnapshot;
+
     /// <summary>Current applied gain (1–500×). At MaxGain the signal is near-inaudible.</summary>
     public double CurrentGain => Math.Min(MaxGain, TargetLevel / _level);
 
@@ -40,7 +45,40 @@ public class InputAgc
         _decayAlpha  = 1.0 - Math.Exp(-1.0 / (decaySeconds  * sampleRate));
     }
 
-    public void Reset() => _level = MinLevel;
+    public void Reset()
+    {
+        _level         = MinLevel;
+        _levelSnapshot = MinLevel;
+        _hasSnapshot   = false;
+    }
+
+    /// <summary>
+    /// Saves the current tracked level so BeginFastRecovery() can restore it exactly.
+    /// Call once per SecondTick; the snapshot at second 59 (just before the minute pulse)
+    /// captures the pre-pulse running gain.
+    /// </summary>
+    public void SnapshotLevel()
+    {
+        _levelSnapshot = _level;
+        _hasSnapshot   = true;
+    }
+
+    /// <summary>
+    /// Restores the tracked level to the pre-minute-pulse snapshot so gain returns to its
+    /// normal running value immediately after the 800 ms minute pulse ends.
+    ///
+    /// Without this, the 5 s decay τ holds gain suppressed for 15–20 s post-pulse, making
+    /// the first few second ticks too weak for the TickDetector to detect.
+    ///
+    /// Falls back to TargetLevel (gain = 1×) if no snapshot has been taken yet (cold start).
+    /// </summary>
+    public void BeginFastRecovery()
+    {
+        if (_hasSnapshot && _level > _levelSnapshot)
+            _level = _levelSnapshot;   // restore pre-pulse gain exactly
+        else if (_level > TargetLevel)
+            _level = TargetLevel;      // cold-start fallback: at least stop gain suppression
+    }
 
     public float[] ProcessBlock(float[] input)
     {

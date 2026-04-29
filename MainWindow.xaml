@@ -366,6 +366,7 @@
                     <RowDefinition Height="8"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="110"/>
@@ -452,6 +453,19 @@
                                    VerticalAlignment="Center" TextWrapping="Wrap"/>
                     </StackPanel>
                 </Border>
+
+                <!-- Input saturation alert banner -->
+                <Border Grid.Row="8" Grid.ColumnSpan="3"
+                        Background="#F9E2AF" CornerRadius="4" Padding="8,5"
+                        Margin="0,4,0,0"
+                        Visibility="{Binding InputSaturationAlert, Converter={StaticResource NonEmptyToVisible}}">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="⚠  " Foreground="#1E1E2E" FontWeight="Bold" FontSize="11" VerticalAlignment="Center"/>
+                        <TextBlock Text="{Binding InputSaturationAlert}"
+                                   Foreground="#1E1E2E" FontSize="11" FontWeight="SemiBold"
+                                   VerticalAlignment="Center" TextWrapping="Wrap"/>
+                    </StackPanel>
+                </Border>
             </Grid>
         </Border>
 
@@ -486,7 +500,8 @@
                               Margin="0,0,14,0"/>
                     <CheckBox Content="Adaptive LP"
                               IsChecked="{Binding EnableAdaptiveLowpass}"
-                              Foreground="#CDD6F4"/>
+                              Foreground="#CDD6F4"
+                              Margin="0,0,14,0"/>
                 </WrapPanel>
 
                 <Grid>
@@ -518,6 +533,77 @@
         <Border Grid.Row="5" Style="{StaticResource PanelBorder}" Margin="0,0,0,10">
             <StackPanel>
                 <TextBlock Text="Frame Bits" Style="{StaticResource SectionHeader}"/>
+                <!-- Field-group labels aligned to the correct NIST IRIG-H bit positions.
+                     Column N = bit N (0-based, matching the 60-cell UniformGrid below).
+                     Markers (9,19,29,39,49,59), reserved bits, and isolated single bits
+                     (UT1 sign at 50, DST2 at 55) are unlabeled — ToolTip shows details. -->
+                <Grid Height="13" Margin="0,2,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <!-- DST/Leap: bits 2–3 (DST Indicator, Leap Second Warning) -->
+                    <Border Grid.Column="2" Grid.ColumnSpan="2"
+                            BorderBrush="#313244" BorderThickness="1,0,1,1" Margin="0.5,0">
+                        <TextBlock Text="DST/Leap" FontSize="7.5" Foreground="#585B70"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,1"/>
+                    </Border>
+                    <!-- Year units: bits 4–7 (1, 2, 4, 8) -->
+                    <Border Grid.Column="4" Grid.ColumnSpan="4"
+                            BorderBrush="#313244" BorderThickness="1,0,1,1" Margin="0.5,0">
+                        <TextBlock Text="Year" FontSize="7.5" Foreground="#585B70"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,1"/>
+                    </Border>
+                    <!-- Minute: bits 10–17 (units 10–13, reserved 14, tens 15–17) -->
+                    <Border Grid.Column="10" Grid.ColumnSpan="8"
+                            BorderBrush="#313244" BorderThickness="1,0,1,1" Margin="0.5,0">
+                        <TextBlock Text="Minute" FontSize="7.5" Foreground="#585B70"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,1"/>
+                    </Border>
+                    <!-- Hour: bits 20–26 (units 20–23, reserved 24, tens 25–26) -->
+                    <Border Grid.Column="20" Grid.ColumnSpan="7"
+                            BorderBrush="#313244" BorderThickness="1,0,1,1" Margin="0.5,0">
+                        <TextBlock Text="Hour" FontSize="7.5" Foreground="#585B70"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,1"/>
+                    </Border>
+                    <!-- Day of Year: bits 30–41 (units 30–33, reserved 34, tens 35–38, P4 marker 39, hundreds 40–41) -->
+                    <Border Grid.Column="30" Grid.ColumnSpan="12"
+                            BorderBrush="#313244" BorderThickness="1,0,1,1" Margin="0.5,0">
+                        <TextBlock Text="Day of Year" FontSize="7.5" Foreground="#585B70"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,1"/>
+                    </Border>
+                    <!-- Year tens: bits 51–54 (10, 20, 40, 80) -->
+                    <Border Grid.Column="51" Grid.ColumnSpan="4"
+                            BorderBrush="#313244" BorderThickness="1,0,1,1" Margin="0.5,0">
+                        <TextBlock Text="Year" FontSize="7.5" Foreground="#585B70"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,1"/>
+                    </Border>
+                    <!-- DUT1 magnitude: bits 56–58 (0.1 s, 0.2 s, 0.4 s); sign is isolated bit 50 -->
+                    <Border Grid.Column="56" Grid.ColumnSpan="3"
+                            BorderBrush="#313244" BorderThickness="1,0,1,1" Margin="0.5,0">
+                        <TextBlock Text="DUT1" FontSize="7.5" Foreground="#585B70"
+                                   HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,1"/>
+                    </Border>
+                </Grid>
                 <ItemsControl ItemsSource="{Binding FrameCells}">
                     <ItemsControl.ItemsPanel>
                         <ItemsPanelTemplate>

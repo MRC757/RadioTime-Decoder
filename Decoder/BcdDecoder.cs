@@ -6,7 +6,7 @@ namespace WwvDecoder.Decoder;
 /// WWV IRIG-H time code format (NIST), bit positions = second numbers 0–59.
 /// All BCD fields are LSB-first (units before tens).
 ///
-///   Pos  0     = P0  reference marker
+///   Pos  0     = Pr  frame-reference hole (no pulse; unused = 0)
 ///   Pos  1     = unused (0)
 ///   Pos  2     = DST1  (DST in effect today at 00:00 UTC)
 ///   Pos  3     = LSW   (leap-second warning — pending at end of month)
@@ -42,25 +42,24 @@ public static class BcdDecoder
     {
         if (bits.Length < 60) return null;
 
-        // Validate position markers — WWV markers at every 10th second: 0, 9, 19, 29, 39, 49, 59
-        if (!IsMarker(bits, 0)  || !IsMarker(bits, 9)  ||
-            !IsMarker(bits, 19) || !IsMarker(bits, 29) ||
-            !IsMarker(bits, 39) || !IsMarker(bits, 49) ||
-            !IsMarker(bits, 59))
+        // Validate the six position markers: P1–P5 at 9,19,29,39,49 and P0 at 59.
+        // Bit 0 is the frame-reference hole (Pr) — it carries no pulse and is NOT a marker.
+        if (!IsMarker(bits, 9)  || !IsMarker(bits, 19) ||
+            !IsMarker(bits, 29) || !IsMarker(bits, 39) ||
+            !IsMarker(bits, 49) || !IsMarker(bits, 59))
             return null;
 
         // Reject frames with excessive spurious markers at non-marker positions.
-        // A clean frame has exactly 7 markers.  More than 5 extras (12 total) indicates
-        // heavy signal corruption — HF fading, SDR audio-AGC pumping, or interference —
-        // and decoding would produce a wrong time rather than no time.
+        // A clean frame has exactly 6 markers.  More than 5 extras (11 total) indicates
+        // heavy signal corruption — HF fading, SDR audio-AGC pumping, or interference.
         int totalMarkers = 0;
         for (int i = 0; i < 60; i++)
             if (bits[i] == 2) totalMarkers++;
-        if (totalMarkers > 12) return null;
+        if (totalMarkers > 11) return null;
 
         // Validate unused bit positions — WWV transmits 0 at these positions.
-        // Any non-zero value indicates signal corruption or wrong frame alignment.
-        ReadOnlySpan<int> unused = [1, 8, 14, 18, 24, 27, 28, 34, 42, 43, 44, 45, 46, 47, 48];
+        // Bit 0 is included: it is the hole (Pr) and carries no pulse data.
+        ReadOnlySpan<int> unused = [0, 1, 8, 14, 18, 24, 27, 28, 34, 42, 43, 44, 45, 46, 47, 48];
         foreach (int r in unused)
             if (bits[r] != 0) return null;
 

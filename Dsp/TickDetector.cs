@@ -155,11 +155,15 @@ public class TickDetector
                 if (_noiseFloor < 1e-6) _noiseFloor = 1e-6;
             }
 
-            // Level tracker: fast attack while tone is present (in pulse), slow decay
-            // while idle. The opposite of PulseDetector (which tracks the 100 Hz carrier
-            // HIGH level during non-pulse periods).
+            // Level tracker: fast attack toward higher values while tone is present,
+            // slow decay while idle. Never pull _levelHigh down during a pulse —
+            // the BandpassFilter/LP ring-down after the tone stops would otherwise
+            // drag _levelHigh to near zero before the exit threshold is crossed.
             if (_inPulse)
-                _levelHigh += _highAttack * (envelope - _levelHigh);
+            {
+                if (envelope > _levelHigh)
+                    _levelHigh += _highAttack * (envelope - _levelHigh);
+            }
             else
                 _levelHigh *= _highDecay;
 
@@ -211,7 +215,10 @@ public class TickDetector
                             _        => null  // intermediate duration — not a valid WWV tone
                         };
                         // Cadence guards:
-                        //   SecondTick:  suppress if within 500 ms of any prior emission.
+                        //   SecondTick:  suppress if within 500 ms of the last SecondTick.
+                        //     MinutePulse does NOT reset this counter — the second-1 tick
+                        //     fires ~144 ms after the minute pulse ends, well inside the
+                        //     500 ms window, and must not be suppressed.
                         //   MinutePulse: suppress if within 50 s of the last minute pulse.
                         //     Real WWV fires exactly once per minute. Anything within 50 s
                         //     is SDR audio energy (voice, noise) whose 1000 Hz envelope
@@ -225,9 +232,18 @@ public class TickDetector
                         if (type.HasValue && allowed)
                         {
                             TickDetected?.Invoke(new TickEvent(type.Value, widthSeconds));
-                            _samplesSinceLastEmit = 0;
+                            if (type == TickType.SecondTick)
+                                _samplesSinceLastEmit = 0;
                             if (type == TickType.MinutePulse)
+                            {
                                 _samplesSinceLastMinutePulse = 0;
+                                // The 800 ms minute pulse drives _levelHigh to its full amplitude.
+                                // Subsequent 5 ms second ticks cannot reach enterThreshold (50% of
+                                // _levelHigh) for ~4 s while the 3 s decay runs. Zeroing here forces
+                                // the threshold to fall back to 8× noiseFloor so the very next tick
+                                // (second 1, ~144 ms after pulse end) is detected and retrains the level.
+                                _levelHigh = 0;
+                            }
                         }
                     }
                     _inPulse = false;

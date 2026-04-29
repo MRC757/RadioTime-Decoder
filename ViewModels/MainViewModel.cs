@@ -138,8 +138,19 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     private double _minuteDotOpacity = 0.35;
     private readonly System.Windows.Threading.DispatcherTimer _minuteDimTimer;
 
+    // DST status from the most recent slow-field-confident frame. Applied to local time.
+    private bool _latestDstActive;
+
+    // Live clock state: UTC time of the most recent confirmed minute boundary (:00),
+    // paired with the system wall-clock time captured at the same moment.
+    // The display timer computes currentUtc = _liveUtcBase + (UtcNow - _liveWallBase).
+    private DateTime? _liveUtcBase;
+    private DateTime? _liveWallBase;
+    private readonly System.Windows.Threading.DispatcherTimer _liveClockTimer;
+
     // Receiver mode alert
     private string? _receiverModeAlert;
+    private string? _inputSaturationAlert;
 
     /// <summary>
     /// When true, the system clock's seconds field is zeroed automatically each time
@@ -168,6 +179,18 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             if (_receiverModeAlert == value) return;
             _receiverModeAlert = value;
+            OnPropertyChanged();
+        }
+    }
+
+    /// <summary>Non-null when the input audio level is too high.</summary>
+    public string? InputSaturationAlert
+    {
+        get => _inputSaturationAlert;
+        private set
+        {
+            if (_inputSaturationAlert == value) return;
+            _inputSaturationAlert = value;
             OnPropertyChanged();
         }
     }
@@ -304,20 +327,45 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             MinuteDotOpacity = 0.35;
         };
 
-        _pipeline.MinutePulseDetected += _ =>
+        _pipeline.MinutePulseDetected += pulseWidth =>
         {
             Application.Current?.Dispatcher.InvokeAsync(() =>
             {
                 MinuteDotOpacity = 1.0;
                 _minuteDimTimer.Stop();
                 _minuteDimTimer.Start();
+
+                // Refine the live clock anchor using the back-calculated true minute start
+                // (now minus measured tone duration ≈ 0.8 s).
+                //
+                // Edge case: the frame decode handler and this minute-pulse handler both
+                // fire at the SAME P0 boundary (the tone ends ~800 ms into the same second
+                // the frame was confirmed). If we blindly add 1 minute here we overshoot
+                // by exactly one minute. Guard by checking elapsed time since the current
+                // wall base: < 30 s means this pulse is concurrent with the frame decode —
+                // just sharpen the wall base; ≥ 30 s means it is a genuinely new minute.
+                if (_liveUtcBase.HasValue && _liveWallBase.HasValue)
+                {
+                    var wallMinuteStart  = DateTime.UtcNow - TimeSpan.FromSeconds(pulseWidth);
+                    double elapsedSinceBase = (wallMinuteStart - _liveWallBase.Value).TotalSeconds;
+                    if (elapsedSinceBase >= 30.0)
+                        _liveUtcBase = _liveUtcBase.Value.AddMinutes(1);
+                    _liveWallBase = wallMinuteStart;
+                }
             });
         };
+
+        _liveClockTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(100)
+        };
+        _liveClockTimer.Tick += (_, _) => RefreshLiveClock();
         LoadDevices();
         LoadStations();
 
-        // Default UTC offset to the system's current local offset (respects DST)
-        int sysOffset = (int)Math.Round(TimeZoneInfo.Local.GetUtcOffset(DateTime.Now).TotalHours);
+        // Default to the standard-time (non-DST) base offset so that the DST bit
+        // decoded from the WWV frame can apply the +1 hour adjustment cleanly.
+        int sysOffset = (int)Math.Round(TimeZoneInfo.Local.BaseUtcOffset.TotalHours);
         sysOffset = Math.Clamp(sysOffset, -12, 14);
         _utcOffsetHours = sysOffset;
         _selectedUtcOffsetLabel = FormatOffset(sysOffset);
@@ -331,8 +379,8 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     }
 
     // Well-known standard-time abbreviations by UTC offset (hour).
-    // DST offsets are intentionally omitted — the decoded UTC time is always standard;
-    // the user's local DST adjustment is handled by Windows, not this selector.
+    // The user selects their standard-time base offset; the DST bit from the WWV frame
+    // automatically adds +1 hour and appends " DST" to the label when active.
     private static readonly Dictionary<int, string> _tzAbbreviations = new()
     {
         [-12] = "IDLW",  // International Date Line West
@@ -573,7 +621,7 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     // Hours and minutes are only trusted after this many consecutive Markov-verified
     // increments.  Each count represents one observed +1-minute transition that matched
     // the predicted timeline — so 3 means four consecutive correctly-decoded frames.
-    private const int TimeConfidenceThreshold = 3;
+    private const int TimeConfidenceThreshold = 2;
 
     public bool CanSetClock => _latestFrame != null && _latestFrame.IsValid
                                && _latestFrame.ConfidenceFrames >= TimeConfidenceThreshold;
@@ -625,6 +673,10 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             _audioInput.Stop();
             _pipeline.Reset();
+            _liveClockTimer.Stop();
+            _liveUtcBase      = null;
+            _liveWallBase     = null;
+            _latestDstActive  = false;
             IsListening = false;
             LockState = LockState.Searching;
             LockStrength = 0;
@@ -669,11 +721,12 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
 
     private void SetClock()
     {
-        if (_latestFrame == null) return;
+        if (_latestFrame == null || _liveUtcBase == null || _liveWallBase == null) return;
         try
         {
-            var delta = _timeSetter.SetTime(_latestFrame.UtcTime);
-            Log($"Clock set. Delta was {delta.TotalMilliseconds:+0.0;-0.0} ms");
+            var currentUtc = _liveUtcBase.Value + (DateTime.UtcNow - _liveWallBase.Value);
+            var delta = _timeSetter.SetTime(currentUtc);
+            Log($"Clock set to {currentUtc:HH:mm:ss} UTC. Delta was {delta.TotalMilliseconds:+0.0;-0.0} ms");
         }
         catch (Exception ex)
         {
@@ -749,6 +802,7 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
                 CountdownDisplay = "";
 
             ReceiverModeAlert = status.ReceiverModeAlert;
+            InputSaturationAlert = status.InputSaturationAlert;
 
             // Keep tick state in sync for the NoSignal decay (no heartbeat fires then).
             if (status.TickState != _tickLockState)
@@ -776,26 +830,45 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         Application.Current?.Dispatcher.InvokeAsync(() =>
         {
-            _latestFrame = frame;
-            var t = frame.UtcTime;
+            // The WWV frame encodes the time of minute M; P0 fires at the start of minute M+1.
+            // Add 1 minute so all display and log output shows the current UTC time.
+            var t = frame.UtcTime.AddMinutes(1);
 
-            // Date, DUT1, DST, and leap-second come from slow BCD fields (DOY/year) that
-            // have their own confirmation mechanism.  Update them on every accepted frame.
-            DecodedDateDisplay = $"{t:MMM dd, yyyy}  ·  Day {t.DayOfYear:D3}";
-            DayOfYear = t.DayOfYear.ToString("D3");
-            Dut1Display = $"{frame.Dut1Seconds:+0.0;-0.0} s";
-            DstDisplay = frame.DstActive ? "Active" : "Off";
-            LeapSecondDisplay = frame.LeapSecondPending ? "Pending" : "None";
+            // Slow fields (date, DOY, DUT1, DST, leap) are updated whenever the BCD decode
+            // passed structural checks, even if the Markov clock check rejected the time.
+            // These fields change slowly and the BCD validity check is sufficient confirmation.
+            if (frame.SlowFieldsConfident)
+            {
+                DecodedDateDisplay = $"{t:MMM dd, yyyy}  ·  Day {t.DayOfYear:D3}";
+                DayOfYear = t.DayOfYear.ToString("D3");
+                Dut1Display = $"{frame.Dut1Seconds:+0.0;-0.0} s";
+                DstDisplay = frame.DstActive ? "Active" : "Off";
+                LeapSecondDisplay = frame.LeapSecondPending ? "Pending" : "None";
+                _latestDstActive = frame.DstActive;
+            }
 
             // Hours and minutes are only shown after TimeConfidenceThreshold consecutive
             // Markov-verified increments.  Before that the display holds "--:--" so a
             // bootstrapping wrong-time decode never reaches the user or SetClock.
-            bool timeConfirmed = frame.ConfidenceFrames >= TimeConfidenceThreshold;
+            bool timeConfirmed = frame.HoursMinutesConfident
+                                 && frame.ConfidenceFrames >= TimeConfidenceThreshold;
             if (timeConfirmed)
             {
-                DecodedTimeDisplay = $"{t:HH:mm:ss} UTC";
-                RefreshLocalTime();
+                _latestFrame = frame;
+                // Anchor the live clock to this confirmed minute boundary.
+                // _liveUtcBase = minute M+1 at :00; _liveWallBase ≈ DateTime.UtcNow at P0.
+                // The minute-pulse handler will refine the wall anchor each subsequent minute.
+                _liveUtcBase  = frame.UtcTime.AddMinutes(1);
+                _liveWallBase = DateTime.UtcNow;
+                if (!_liveClockTimer.IsEnabled)
+                    _liveClockTimer.Start();
+                RefreshLiveClock();
             }
+
+            // Track the latest frame for SetClock gating; use the most recent Markov-passed
+            // frame. Partial (slow-only) frames do not update _latestFrame.
+            if (frame.HoursMinutesConfident)
+                _latestFrame = frame;
 
             ConfidencePercent = Math.Min(100,
                 (frame.ConfidenceFrames / (double)TimeConfidenceThreshold) * 100);
@@ -806,18 +879,30 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
 
             if (timeConfirmed)
                 Log($"Frame confirmed: {t:yyyy-MM-dd HH:mm:ss} UTC  DUT1={frame.Dut1Seconds:+0.0;-0.0}s");
+            else if (frame.SlowFieldsConfident && !frame.HoursMinutesConfident)
+                Log($"Partial frame: date={t:yyyy-MM-dd} DOY={t.DayOfYear:D3} — time pending Markov verification");
             else
                 Log($"Frame decoded (unconfirmed {frame.ConfidenceFrames}/{TimeConfidenceThreshold}): " +
                     $"{t:yyyy-MM-dd HH:mm} UTC");
         });
     }
 
-    private void RefreshLocalTime()
+    private void RefreshLiveClock()
     {
-        if (_latestFrame == null || !_latestFrame.IsValid) return;
-        var localTime = _latestFrame.UtcTime.AddHours(_utcOffsetHours);
-        LocalTimeDisplay = $"{localTime:HH:mm:ss}  ({_selectedUtcOffsetLabel})";
+        if (_liveUtcBase == null || _liveWallBase == null) return;
+        var currentUtc = _liveUtcBase.Value + (DateTime.UtcNow - _liveWallBase.Value);
+        DecodedTimeDisplay = $"{currentUtc:HH:mm:ss} UTC";
+
+        // Apply standard-time offset plus 1 hour when DST is active per the WWV frame.
+        double effectiveOffset = _utcOffsetHours + (_latestDstActive ? 1.0 : 0.0);
+        var localTime = currentUtc.AddHours(effectiveOffset);
+        string offsetLabel = _latestDstActive
+            ? FormatOffset((int)(_utcOffsetHours + 1)) + " DST"
+            : _selectedUtcOffsetLabel;
+        LocalTimeDisplay = $"{localTime:HH:mm:ss}  ({offsetLabel})";
     }
+
+    private void RefreshLocalTime() => RefreshLiveClock();
 
     private void Log(string message)
     {

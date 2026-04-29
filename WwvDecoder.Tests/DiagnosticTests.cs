@@ -10,36 +10,69 @@ public class DiagnosticTests
     [Fact]
     public void FullPipeline_DetectsPulsesWithinThirtySeconds()
     {
-        // Verify the full DSP chain (AGC → ALE → SyncDet → PulseDetector) detects
+        // Verify the full DSP chain (AGC → SyncDet → TickDetector → PulseDetector) detects
         // at least 10 non-Tick pulses within 30 seconds of clean simulation signal.
-        // This isolates whether the AGC+ALE initial transient prevents pulse detection.
+        // PulseDetector requires NotifyTick() per second; TickDetector provides this.
         var gen = new WwvSignalGenerator(Sr, seed: 0);
         gen.SetTime(new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc));
         gen.NoiseSigma = 0;
 
         var agc  = new InputAgc(Sr, attackSeconds: 3.0, decaySeconds: 5.0);
-        var ale  = new AdaptiveLineEnhancer(delay: 5, taps: 128, mu: 0.3);
         var det  = new SynchronousDetector(Sr, subcarrierHz: 100.0, lowpassHz: 8.0);
+        var tick = new TickDetector(Sr);
         var pd   = new PulseDetector(Sr, det);
 
-        int pulseCount = 0;
-        pd.PulseDetected += p => { if (p.Type != PulseType.Tick) pulseCount++; };
-
         int blockSize = Sr / 20; // 50 ms
+
+        // Run a full 60-second frame through the pipeline before wiring event handlers.
+        // This lets the AGC settle (τ=3s), TickDetector noise floor decay to its true
+        // value, and PulseDetector._levelHigh stabilize at the normalized signal level.
+        // Without warmup the initial 500× AGC gain inflates internal level trackers and
+        // blocks pulse detection for the first ~20 seconds.
+        for (int b = 0; b < 60 * 20; b++)
+        {
+            var raw  = gen.GenerateBlock(blockSize);
+            var agcO = agc.ProcessBlock(raw);
+            tick.ProcessBlock(agcO);
+            var env  = det.ProcessBlock(agcO);
+            pd.ProcessBlock(env);
+        }
+
+        // Wire TickDetector → PulseDetector.NotifyTick() so rising-edge windows open
+        int tickCount = 0;
+        var tickLog = new List<string>();
+        tick.TickDetected += t => {
+            tickCount++;
+            tickLog.Add($"t={t.Type} w={t.WidthSeconds*1000:F0}ms lev={tick.LevelHigh:F3}");
+            pd.NotifyTick(tick.LevelHigh);
+        };
+
+        int pulseCount = 0;
+        var pulseLog = new List<string>();
+        pd.PulseDetected += p => {
+            if (p.Type != PulseType.Tick) pulseCount++;
+            pulseLog.Add($"{p.Type} d={p.EffectiveDuration:F3}s conf={p.Confidence:F2}");
+        };
+        pd.OnLog = msg => pulseLog.Add("[PD] " + msg);
+
         int maxBlocks = 30 * 20; // 30 seconds
 
         for (int b = 0; b < maxBlocks; b++)
         {
             var raw  = gen.GenerateBlock(blockSize);
             var agcO = agc.ProcessBlock(raw);
-            var aleO = ale.ProcessBlock(agcO);
-            var env  = det.ProcessBlock(aleO);
+            // TickDetector runs on filtered audio before envelope detection
+            tick.ProcessBlock(agcO);
+            var env  = det.ProcessBlock(agcO);
             pd.ProcessBlock(env);
         }
 
+        string diagLog = string.Join("\n", pulseLog.Take(40));
+        string tickDiag = string.Join("\n", tickLog.Take(35));
         Assert.True(pulseCount >= 10,
             $"Expected ≥10 non-Tick pulses within 30s; got {pulseCount}. " +
-            $"LevelHigh={pd.LevelHigh:F4}");
+            $"Ticks fired: {tickCount}. LevelHigh={pd.LevelHigh:F4}\n" +
+            $"--- Ticks ---\n{tickDiag}\n--- Pulses ---\n{diagLog}");
     }
 
     [Fact]
@@ -87,7 +120,15 @@ public class DiagnosticTests
     [Fact]
     public void PulseDetector_DetectsMarkerAfterWarmup()
     {
-        // After 1 second of HIGH (to build levelHigh), a Marker (800ms LOW) should be detected.
+        // WWV positive-pulse model: each second the carrier is HIGH for the bit duration,
+        // then LOW for the remainder.  PulseDetector requires NotifyTick() to arm the
+        // 200 ms rising-edge detection window before the HIGH period begins.
+        //
+        // Test sequence:
+        //   1. 1 s HIGH warm-up  → builds levelHigh (no tick, no pulse collected)
+        //   2. NotifyTick()      → arms the 200 ms rising-edge window
+        //   3. 800 ms HIGH       → Marker HIGH period; pulse buffer fills
+        //   4. 200 ms LOW        → dropout tolerance exceeded → pulse fires
         var det = new SynchronousDetector(Sr, subcarrierHz: 100.0, lowpassHz: 8.0);
         var pd  = new PulseDetector(Sr, det);
 
@@ -97,20 +138,30 @@ public class DiagnosticTests
         double omega = 2.0 * Math.PI * 100.0 / Sr;
         double phase = 0;
 
-        // 1 s HIGH warm-up
-        var high = new float[Sr];
-        for (int i = 0; i < Sr; i++) { high[i] = (float)Math.Sin(phase); phase += omega; if (phase >= Math.PI*2) phase -= Math.PI*2; }
-        pd.ProcessBlock(det.ProcessBlock(high));
+        float[] MakeSamples(int n, double amp)
+        {
+            var buf = new float[n];
+            for (int i = 0; i < n; i++)
+            {
+                buf[i] = (float)(amp * Math.Sin(phase));
+                phase  += omega;
+                if (phase >= Math.PI * 2) phase -= Math.PI * 2;
+            }
+            return buf;
+        }
 
-        // 800 ms LOW (Marker)
-        var low = new float[(int)(0.8 * Sr)];
-        for (int i = 0; i < low.Length; i++) { low[i] = (float)(0.316 * Math.Sin(phase)); phase += omega; if (phase >= Math.PI*2) phase -= Math.PI*2; }
-        pd.ProcessBlock(det.ProcessBlock(low));
+        // Step 1: 1 s HIGH warm-up — builds levelHigh so thresholds are meaningful
+        pd.ProcessBlock(det.ProcessBlock(MakeSamples(Sr, amp: 1.0)));
 
-        // 500 ms HIGH (to let the pulse fire on envelope recovery)
-        var high2 = new float[(int)(0.5 * Sr)];
-        for (int i = 0; i < high2.Length; i++) { high2[i] = (float)Math.Sin(phase); phase += omega; if (phase >= Math.PI*2) phase -= Math.PI*2; }
-        pd.ProcessBlock(det.ProcessBlock(high2));
+        // Step 2: arm the rising-edge detection window (simulates the 1 kHz second tick)
+        pd.NotifyTick(tickAmplitude: 1.0);
+
+        // Step 3: 800 ms HIGH — Marker HIGH duration; samples accumulate in pulse buffer
+        pd.ProcessBlock(det.ProcessBlock(MakeSamples((int)(0.8 * Sr), amp: 1.0)));
+
+        // Step 4: 200 ms LOW — amplitude drops to −10 dBc (31.6%); dropout tolerance
+        // (75 ms) is exceeded → pulse fires as Marker
+        pd.ProcessBlock(det.ProcessBlock(MakeSamples((int)(0.2 * Sr), amp: 0.316)));
 
         Assert.NotNull(captured);
         Assert.Equal(PulseType.Marker, captured.Type);

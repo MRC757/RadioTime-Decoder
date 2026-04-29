@@ -18,4 +18,6 @@ public class SignalStatus
     public TickLockState TickState { get; set; }
     /// <summary>Non-null when the receiver appears to be in the wrong demodulation mode.</summary>
     public string? ReceiverModeAlert { get; set; }
+    /// <summary>Non-null when the input audio level is too high and the user should reduce volume.</summary>
+    public string? InputSaturationAlert { get; set; }
 }

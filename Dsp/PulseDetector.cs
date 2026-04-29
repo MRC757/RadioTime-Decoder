@@ -3,48 +3,46 @@ namespace WwvDecoder.Dsp;
 /// <summary>
 /// Detects and measures binary pulses from the amplitude envelope.
 ///
-/// WWV signal model:
-///   The 100 Hz subcarrier is always present. At the start of each second, its power
-///   is REDUCED (by 10 dB) for a duration that encodes the bit value. The encoding
-///   is in the LOW period (reduced power), not the high period.
+/// WWV signal model (positive-pulse / NIST IRIG-H model):
+///   At the start of each second, the 100 Hz subcarrier rises to full power ~30 ms
+///   after the 1 kHz second tick. It holds HIGH for a duration that encodes the bit
+///   value, then drops to reduced power (−10 dBc) for the remainder of the second.
+///   The encoding is in the HIGH period duration.
 ///
-/// WWV BCD pulse encoding (each second, starting at t=0):
-///   Bit 0   = 0.2 s LOW (reduced), then 0.8 s HIGH (full power)
-///   Bit 1   = 0.5 s LOW (reduced), then 0.5 s HIGH (full power)
-///   Marker  = 0.8 s LOW (reduced), then 0.2 s HIGH (full power)
+/// WWV BCD pulse encoding (each second, starting at tick):
+///   Bit 0   = ~170 ms HIGH, then LOW until next tick
+///   Bit 1   = ~470 ms HIGH, then LOW until next tick
+///   Marker  = ~770 ms HIGH, then LOW until next tick
 ///
-/// This detector measures the LOW duration (time below threshold) and fires
-/// PulseDetected when the signal rises back above threshold.
+/// This detector measures the HIGH duration (time above threshold) and fires
+/// PulseDetected when the signal drops back below threshold, or at the next tick
+/// if the falling edge was missed (backstop via NotifyTick).
 ///
 /// Hysteresis thresholds (prevents chattering on slow envelope transitions):
-///   Enter pulse (go LOW) : sample &lt; 0.55 × levelHigh
-///   Exit  pulse (go HIGH): sample &gt; 0.62 × levelHigh
-///   Dead-band = 7% of levelHigh — the synchronous detector's slowly-rising
-///   envelope must fully clear this band before the pulse is considered over.
+///   Enter pulse (go HIGH): sample > 0.62 × levelHigh  (exitThreshold)
+///   Exit  pulse (go LOW) : sample < 0.55 × levelHigh  (enterThreshold)
+///   Dead-band = 7% of levelHigh.
 ///
-/// Pulse classification (based on LOW duration):
-///   &lt; 0.10 s    → Tick   (noise/transition glitch, ignored)
-///   0.10–0.35 s → Zero   (nominal 0.2 s)
-///   0.35–0.65 s → One    (nominal 0.5 s)
-///   ≥ 0.65 s    → Marker (nominal 0.8 s)
+/// Rising-edge detection is gated to a 200 ms window opened by NotifyTick().
+/// This prevents spurious entry from noise or fading between seconds.
 ///
 /// levelHigh tracking uses two mechanisms:
-///   • Real-time asymmetric IIR (100 ms attack / 3 s decay): drives enterThreshold
-///     and exitThreshold for per-sample pulse detection.
+///   • Real-time asymmetric IIR (100 ms attack / 3 s decay): drives enter/exit thresholds.
 ///   • 75th-percentile of the last 30 inter-pulse HIGH-period peaks (Option 3):
 ///     a fade-resistant reference used for MatchedFilter classification.
 ///     Multipath constructive spikes appear as high outliers (ignored); HF-fade-
 ///     depressed HIGH periods appear as low outliers (ignored). Falls back to the
 ///     IIR until ≥ 3 entries are populated.
 ///
-/// IsFading (Option 2):
-///   Driven by comparing the current envelope to 15% of the stable carrier reference,
-///   measured only during !_inPulse (between-pulse HIGH) periods. WWV LOW carrier
-///   ≈ 31% of HIGH — well above 15%. Deep HF fades drop the envelope to &lt; 5%,
-///   triggering IsFading. The fade counter is gated to !_inPulse because a pulse LOW
-///   period is intentionally reduced amplitude (BCD data), not a propagation fade.
-///   The earlier implementation counted pulse LOW samples as fade evidence, causing
-///   IsFading to fire on every One/Marker at low SNR and zero-weighing all bits.
+/// IsFading:
+///   Driven by comparing the 1 kHz tick amplitude to a 5-tick IIR average.
+///   Set when the current tick falls below 30% of the running average (~−10 dB fade).
+///   Pulses emitted while IsFading carry confidence = 0 (erasure weight).
+///
+/// AmplitudeVariability / IsAmplitudeUnstable:
+///   Driven by the relative envelope deviation from levelHigh during HIGH periods.
+///   Engages at 30% relative deviation; clears at 15%. Triggers the adaptive LP
+///   to widen from 2 Hz to 8 Hz when multipath fading is detected.
 /// </summary>
 public class PulseDetector
 {
@@ -67,44 +65,31 @@ public class PulseDetector
     private readonly double _varAlpha;  // τ ≈ 3 s
     private bool _isAmplitudeUnstable;  // hysteresis state: engage at 0.30, disengage at 0.15
 
-    // Fade detector (Option 2): IsFading is true when the envelope has been consistently
-    // below 15% of the stable carrier reference for > 200 ms and has not yet recovered.
-    // Pulses emitted while IsFading carry confidence = 0 (erasure weight) so a wrongly-
-    // classified fade pulse cannot outvote clean frames in the multi-frame accumulator.
-    private readonly int _fadeMinSamples;         // 200 ms
-    private readonly int _fadeRecoveryMinSamples; // 500 ms
-    private int _consecutiveLowSamples;
-    private int _fadeRecoverySamples;
-    public bool IsFading { get; private set; }
-
     private bool _inPulse;
     private int _pulseSamples;
     private int _gapSamples;
     private double _peakEnvelope;
     private double _levelHigh;     // real-time IIR tracker: drives enter/exit thresholds
 
-    // Snapshot of _levelHighAtPulseStart taken when a pulse begins.
-    // With the percentile tracker this equals _levelHighPct (stable carrier estimate).
-    // Falls back to the IIR _levelHigh before the percentile window is populated.
+    // Snapshot of levelHigh taken when a pulse begins.
     private double _levelHighAtPulseStart;
 
     // Percentile-based carrier level (Option 3).
-    // Each time a pulse starts, the peak envelope accumulated during the preceding
-    // HIGH period is pushed into a 30-entry circular window. The 75th percentile of
-    // this window gives a fade-resistant carrier reference:
-    //   • Multipath spikes inflate the IIR but appear as high outliers here — ignored.
-    //   • HF-faded HIGH periods reduce the IIR but appear as low outliers here — ignored.
-    // Populated after ≥ 3 inter-pulse peaks; falls back to IIR _levelHigh until then.
-    private const int    PctWindowSize = 30;      // ~30 seconds of WWV signal
-    private const double PctFraction   = 0.75;    // 75th percentile
+    private const int    PctWindowSize = 30;
+    private const double PctFraction   = 0.75;
     private readonly double[] _highPeakWindow = new double[PctWindowSize];
-    private int    _highPeakHead;    // next write slot (circular)
-    private int    _highPeakCount;   // filled entries (0..PctWindowSize)
-    private double _interPulsePeak;  // running peak during the current inter-pulse HIGH period
-    private double _levelHighPct;    // 75th-percentile estimate; 0 until ≥ 3 entries
+    private int    _highPeakHead;
+    private int    _highPeakCount;
+    private double _interPulsePeak;
+    private double _levelHighPct;
 
-    // Matched filter: buffer the envelope samples during the LOW period so the
-    // classifier can count genuinely-low samples rather than relying on edge timing.
+    // Tick-anchored detection fields.
+    // _tickWindowSamples: countdown after NotifyTick(); rising edge only accepted while > 0.
+    // _tickAmplitudeIir: IIR average of 1 kHz tick peak amplitudes (τ ≈ 5 ticks).
+    private int    _tickWindowSamples;
+    private double _tickAmplitudeIir;
+    private readonly double _tickFadeAlpha; // α = 1 − exp(−1/5) ≈ 0.181
+
     private readonly List<double> _pulseBuffer = new();
 
     public event Action<PulseEvent>? PulseDetected;
@@ -112,12 +97,12 @@ public class PulseDetector
 
     public double CurrentEnvelope { get; private set; }
     public double PeakEnvelope => _peakEnvelope;
+    public bool IsFading { get; private set; }
 
     /// <summary>
     /// Stable carrier HIGH level used for pulse classification.
     /// Returns the 75th-percentile estimate when the window is populated (≥ 3 inter-pulse
-    /// peaks), otherwise the real-time IIR tracker. The percentile is resistant to both
-    /// multipath spikes (high outliers) and HF-fade-depressed HIGH periods (low outliers).
+    /// peaks), otherwise the real-time IIR tracker.
     /// </summary>
     public double LevelHigh => _levelHighPct > 0 ? _levelHighPct : _levelHigh;
 
@@ -130,8 +115,7 @@ public class PulseDetector
 
     /// <summary>
     /// True when the carrier amplitude is varying too rapidly for the 2 Hz LP filter
-    /// to track — the hallmark of HF multipath fading at 1–3 Hz rates.
-    /// Engages when the 3 s–smoothed relative deviation exceeds 30 %; clears at 15 %.
+    /// to track. Engages at 30% relative deviation; clears at 15%.
     /// </summary>
     public bool IsAmplitudeUnstable => _isAmplitudeUnstable;
 
@@ -139,23 +123,21 @@ public class PulseDetector
     {
         _sampleRate = sampleRate;
         _detector = detector;
-        _dropoutToleranceSamples = sampleRate * 75   / 1000; // 75 ms ignores ionospheric flutter shorter than this
+        _dropoutToleranceSamples = sampleRate * 75   / 1000;
         _minPulseSamples         = sampleRate * 50   / 1000;
         _maxPulseSamples         = sampleRate * 1100 / 1000;
         _highDecay      = Math.Exp(-1.0 / (3.0   * sampleRate));
         _highAttack     = 1.0 - Math.Exp(-1.0 / (0.100 * sampleRate));
         _highFastAttack = 1.0 - Math.Exp(-1.0 / (0.030 * sampleRate));
-        _fadeMinSamples         = sampleRate * 200 / 1000;
-        _fadeRecoveryMinSamples = sampleRate * 500 / 1000;
-        _refractorySamples      = sampleRate * 200 / 1000; // 200 ms covers Marker HIGH gap (200 ms)
+        _refractorySamples      = sampleRate * 200 / 1000;
         _varAlpha               = 1.0 - Math.Exp(-1.0 / (3.0 * sampleRate));
+        _tickFadeAlpha          = 1.0 - Math.Exp(-1.0 / 5.0);
     }
 
     /// <summary>
     /// Discard any pulse currently in progress without emitting it.
     /// Called on minute-pulse re-anchor so the P0 Marker can be detected
     /// fresh rather than being consumed by an overflow of the P59 pulse.
-    /// Refractory is cleared so the P0 LOW period is entered immediately.
     /// </summary>
     public void AbortCurrentPulse()
     {
@@ -164,7 +146,21 @@ public class PulseDetector
         _gapSamples     = 0;
         _pulseBuffer.Clear();
         _refractory     = 0;
-        _interPulsePeak = 0; // start the next inter-pulse HIGH period fresh
+        _interPulsePeak = 0;
+    }
+
+    /// <summary>
+    /// Clears the inter-pulse peak history used to compute the percentile-based level
+    /// reference. Call after a known anchor event (minute pulse) so the reference
+    /// relearns from the post-pulse signal level rather than pre-pulse peaks that may
+    /// have been recorded before an AGC gain change.
+    /// </summary>
+    public void ClearLevelReference()
+    {
+        _highPeakCount  = 0;
+        _highPeakHead   = 0;
+        _levelHighPct   = 0;
+        _interPulsePeak = 0;
     }
 
     public void Reset()
@@ -176,8 +172,6 @@ public class PulseDetector
         _levelHigh             = 0;
         _levelHighAtPulseStart = 0;
         _pulseBuffer.Clear();
-        _consecutiveLowSamples = 0;
-        _fadeRecoverySamples   = 0;
         IsFading               = false;
         _refractory            = 0;
         _amplitudeVariability  = 0;
@@ -186,6 +180,59 @@ public class PulseDetector
         _highPeakCount         = 0;
         _interPulsePeak        = 0;
         _levelHighPct          = 0;
+        _tickWindowSamples     = 0;
+        _tickAmplitudeIir      = 0;
+    }
+
+    /// <summary>
+    /// Called by DecoderPipeline when a 1 kHz second tick (or minute pulse) fires.
+    ///
+    /// (1) Backstop: if _inPulse is still true, the previous second's falling edge was
+    ///     missed. Fire the accumulated pulse — the matched filter counts only samples
+    ///     above midThreshold, so any trailing LOW samples are silently excluded.
+    /// (2) Window: arms a rising-edge detection window. The normal window is 200 ms, but
+    ///     callers may pass a larger value (e.g. 400 ms for the minute-pulse notification)
+    ///     so a subsequent tick within that window cannot shrink it via Math.Max.
+    /// (3) Fading: updates IsFading from the tick amplitude IIR.
+    ///
+    /// IMPORTANT: DecoderPipeline must call TickDetector.ProcessBlock() BEFORE
+    /// PulseDetector.ProcessBlock() so the notification arrives before the 100 Hz
+    /// rising edge (~30–80 ms after the tick) within the same audio block.
+    /// </summary>
+    public void NotifyTick(double tickAmplitude, int windowMs = 200)
+    {
+        if (_inPulse)
+        {
+            if (_pulseSamples > _minPulseSamples)
+            {
+                double pulseWidthSeconds = (double)_pulseSamples / _sampleRate;
+                var (matchedType, confidence, effDuration) =
+                    MatchedFilter.ClassifyWithConfidence(
+                        _pulseBuffer, _sampleRate, _levelHighAtPulseStart);
+                double emitConfidence = IsFading ? 0.0 : confidence;
+                PulseDetected?.Invoke(new PulseEvent(
+                    pulseWidthSeconds, matchedType, emitConfidence, effDuration));
+            }
+            _inPulse      = false;
+            _pulseSamples = 0;
+            _gapSamples   = 0;
+            _pulseBuffer.Clear();
+        }
+
+        // Use Math.Max so a large window opened by the minute-pulse notification
+        // cannot be shrunk by the false SecondTick that fires milliseconds later
+        // from the BPF/LP ring-down (which also calls NotifyTick with the default
+        // 200 ms). Once the extended window has naturally elapsed to zero, subsequent
+        // normal SecondTicks restore the default 200 ms window as usual.
+        _tickWindowSamples = Math.Max(_tickWindowSamples, _sampleRate * windowMs / 1000);
+        _refractory        = 0;
+
+        if (_tickAmplitudeIir < 1e-9)
+            _tickAmplitudeIir = tickAmplitude > 1e-9 ? tickAmplitude : 1e-9;
+        else
+            _tickAmplitudeIir += _tickFadeAlpha * (tickAmplitude - _tickAmplitudeIir);
+
+        IsFading = _tickAmplitudeIir > 1e-6 && tickAmplitude < _tickAmplitudeIir * 0.30;
     }
 
     public void ProcessBlock(float[] envelopeSamples)
@@ -196,36 +243,19 @@ public class PulseDetector
             if (sample > _peakEnvelope) _peakEnvelope = sample;
             _peakEnvelope *= 0.9999;
 
-            // Track carrier HIGH level with asymmetric IIR.
-            // Attack is gated to !_inPulse so LOW-period samples cannot inflate
-            // _levelHigh and push exitThreshold above the true carrier level.
-            // Fast-recovery branch (30 ms τ) snaps the tracker back after a deep
-            // fade where _levelHigh has decayed to ~69% of the true carrier.
-            if (!_inPulse)
+            // Track carrier level unconditionally so _levelHigh bootstraps from the
+            // first sample. Fast attack during HIGH pulses, slow decay during LOW gaps.
+            if (sample > _levelHigh)
             {
-                if (sample > _levelHigh)
-                {
-                    double attack = sample > _levelHigh * 1.2 ? _highFastAttack : _highAttack;
-                    _levelHigh += attack * (sample - _levelHigh);
-                }
-                else
-                    _levelHigh *= _highDecay;
-
-                // Accumulate the inter-pulse peak for the percentile window.
-                // Sampled over the full HIGH period (including refractory) so even
-                // short 200 ms Marker HIGH periods contribute a representative value.
-                if (sample > _interPulsePeak) _interPulsePeak = sample;
+                double attack = sample > _levelHigh * 1.2 ? _highFastAttack : _highAttack;
+                _levelHigh += attack * (sample - _levelHigh);
             }
             else
-            {
                 _levelHigh *= _highDecay;
-            }
 
-            // Weak-signal guard: suppress detection when no carrier is established.
-            // Uses a capped noise reference to prevent the noise estimator drifting
-            // toward the carrier level (a known artifact on clean simulation signals
-            // where no truly quiet period exists) from incorrectly marking the carrier
-            // absent during Marker LOW periods.
+            // Accumulate inter-pulse peak during the HIGH pulse period for the percentile window.
+            if (_inPulse && sample > _interPulsePeak) _interPulsePeak = sample;
+
             double noise = Math.Min(_detector.NoiseFloor, _levelHigh * 0.10);
             bool hasSignal = _levelHigh > noise * 3.0;
 
@@ -238,49 +268,11 @@ public class PulseDetector
                     _gapSamples = 0;
                     _pulseBuffer.Clear();
                 }
-                continue; // skip threshold detection until carrier is present
+                continue;
             }
 
-            // ── Fade detection (Option 2) ────────────────────────────────────────
-            // Compare the current envelope to 15% of the stable carrier reference.
-            // WWV LOW carrier ≈ 31% of levelHigh — well above 15%. Deep HF fades
-            // drop the envelope to noise level (< 5%), correctly triggering IsFading.
-            // The percentile reference (_levelHighPct) is used when populated because
-            // it is unaffected by multipath spikes that can transiently inflate the
-            // IIR _levelHigh, which would then raise the 15% threshold and miss fades.
-            double stableRef = _levelHighPct > 0 ? _levelHighPct : _levelHigh;
-            bool envelopeAbsent = stableRef > 1e-6 && sample < stableRef * 0.15;
-
-            if (envelopeAbsent)
-            {
-                // Only count fade evidence during between-pulse HIGH periods.
-                // During a pulse LOW period the envelope is intentionally reduced (that is
-                // the BCD data), not a genuine HF fade. Counting those samples caused
-                // IsFading to fire on every One/Marker pulse at low SNR, zero-weighting
-                // all bits and producing 00:00 decoded time every frame.
-                if (!_inPulse) _consecutiveLowSamples++;
-                if (_consecutiveLowSamples >= _fadeMinSamples) IsFading = true;
-                _fadeRecoverySamples = 0;
-            }
-            else
-            {
-                _consecutiveLowSamples = 0;
-                if (IsFading)
-                {
-                    // Require 500 ms of continuous signal AND levelHigh ≥ 60% of
-                    // peakEnvelope before trusting pulses again.
-                    _fadeRecoverySamples++;
-                    if (_fadeRecoverySamples >= _fadeRecoveryMinSamples
-                        && _levelHigh >= _peakEnvelope * 0.60)
-                        IsFading = false;
-                }
-                else
-                    _fadeRecoverySamples = 0;
-            }
-
-            // Track amplitude variability during HIGH periods (not in pulse).
-            // relDev = |envelope − levelHigh| / levelHigh; smoothed over ~3 s.
-            if (!_inPulse && _levelHigh > 1e-6)
+            // Amplitude variability tracking during HIGH pulse periods.
+            if (_inPulse && _levelHigh > 1e-6)
             {
                 double relDev = Math.Abs(sample - _levelHigh) / _levelHigh;
                 _amplitudeVariability += _varAlpha * (relDev - _amplitudeVariability);
@@ -288,29 +280,20 @@ public class PulseDetector
                 else if (_amplitudeVariability < 0.15) _isAmplitudeUnstable = false;
             }
 
-            // Hysteresis thresholds — fractions of the real-time IIR _levelHigh.
-            // The IIR is used here (not the percentile) because thresholds need
-            // per-sample responsiveness; the percentile updates only once per pulse.
-            //   Enter: 55% — well above LOW carrier (31%); detects pulse even when
-            //          _levelHigh is depressed post-Marker (76% of carrier →
-            //          enterThreshold = 42% of carrier, still > 31% LOW).
-            //   Exit:  62% — safely below HIGH (100%), ends pulse detection.
             double enterThreshold = _levelHigh * 0.55;
             double exitThreshold  = _levelHigh * 0.62;
 
+            // Count down the tick arm window every sample.
+            if (_tickWindowSamples > 0) _tickWindowSamples--;
+
             if (!_inPulse)
             {
-                if (_refractory > 0)
+                // Only accept a rising edge while the post-tick window is open.
+                if (_tickWindowSamples > 0 && sample > exitThreshold)
                 {
-                    _refractory--;
-                }
-                else if (sample < enterThreshold)
-                {
-                    // ── Percentile window update (Option 3) ─────────────────────
-                    // Push the peak seen during this inter-pulse HIGH period into the
-                    // circular window, then recompute the 75th percentile.
-                    // Guard against zero peaks (e.g., very first pulse at startup
-                    // before any HIGH samples have been observed).
+                    // Push the inter-pulse LOW period peak into the percentile window.
+                    // In positive-pulse mode the LOW period is between pulses — we track
+                    // the preceding HIGH pulse peak accumulated in _interPulsePeak.
                     if (_interPulsePeak > 0)
                     {
                         _highPeakWindow[_highPeakHead] = _interPulsePeak;
@@ -324,9 +307,7 @@ public class PulseDetector
                     _inPulse      = true;
                     _pulseSamples = 1;
                     _gapSamples   = 0;
-                    // Use the stable percentile reference for the MatchedFilter so
-                    // multipath spikes and HF fades do not corrupt the midThreshold.
-                    // Falls back to the IIR snapshot until the window is populated.
+                    _tickWindowSamples = 0;
                     _levelHighAtPulseStart = _levelHighPct > 0 ? _levelHighPct : _levelHigh;
                     _pulseBuffer.Clear();
                     _pulseBuffer.Add(sample);
@@ -343,7 +324,7 @@ public class PulseDetector
                     _pulseBuffer.Clear();
                     _refractory   = _refractorySamples;
                 }
-                else if (sample > exitThreshold)
+                else if (sample < enterThreshold)  // falling edge → HIGH pulse ending
                 {
                     _gapSamples++;
                     if (_gapSamples >= _dropoutToleranceSamples)
@@ -351,16 +332,9 @@ public class PulseDetector
                         if (_pulseSamples > _minPulseSamples)
                         {
                             double pulseWidthSeconds = (double)_pulseSamples / _sampleRate;
-                            // MatchedFilter classifies by counting samples below
-                            // midThreshold = 0.5 × _levelHighAtPulseStart.
-                            // With the percentile reference, midThreshold is stable:
-                            // multipath spikes that inflate the IIR cannot raise it,
-                            // and HF-faded HIGH periods that depress the IIR cannot
-                            // lower it below the true LOW carrier level.
-                            double referenceLevel = _levelHighAtPulseStart;
                             var (matchedType, confidence, effDuration) =
                                 MatchedFilter.ClassifyWithConfidence(
-                                    _pulseBuffer, _sampleRate, referenceLevel);
+                                    _pulseBuffer, _sampleRate, _levelHighAtPulseStart);
                             double emitConfidence = IsFading ? 0.0 : confidence;
                             PulseDetected?.Invoke(new PulseEvent(
                                 pulseWidthSeconds, matchedType, emitConfidence, effDuration));
@@ -386,10 +360,6 @@ public class PulseDetector
         }
     }
 
-    /// <summary>
-    /// Computes the 75th percentile of the active entries in <c>_highPeakWindow</c>.
-    /// Called once per pulse (~1 Hz) so the O(N log N) sort over 30 entries is negligible.
-    /// </summary>
     private double ComputePercentile()
     {
         var buf = new double[_highPeakCount];
@@ -410,8 +380,7 @@ public record PulseEvent(double WidthSeconds, PulseType? MatchedType = null, dou
                          double EffectiveDuration = 0.0)
 {
     /// <summary>
-    /// Duration-based fallback: classify by raw edge-to-edge LOW duration.
-    /// Includes positive bias from the envelope's rise/fall times.
+    /// Duration-based fallback: classify by raw edge-to-edge HIGH duration.
     /// </summary>
     public PulseType DurationType => WidthSeconds switch
     {
@@ -423,8 +392,7 @@ public record PulseEvent(double WidthSeconds, PulseType? MatchedType = null, dou
 
     /// <summary>
     /// Best classification: matched filter result when available, falling back to
-    /// duration-based. The matched filter counts genuinely-LOW samples, removing the
-    /// positive bias from envelope transition times.
+    /// duration-based.
     /// </summary>
     public PulseType Type => MatchedType ?? DurationType;
 }
@@ -437,12 +405,12 @@ public enum PulseType
     /// <summary>Transition artifact (&lt; 100 ms). Not used for time decoding.</summary>
     Tick,
 
-    /// <summary>Zero pulse (0.2 s), encodes a binary 0 in the BCD time code.</summary>
+    /// <summary>Zero pulse (~170 ms HIGH), encodes a binary 0 in the BCD time code.</summary>
     Zero,
 
-    /// <summary>One pulse (0.5 s), encodes a binary 1 in the BCD time code.</summary>
+    /// <summary>One pulse (~470 ms HIGH), encodes a binary 1 in the BCD time code.</summary>
     One,
 
-    /// <summary>Marker pulse (0.8 s), position markers at P0..P5 and P9 to frame the time frame.</summary>
+    /// <summary>Marker pulse (~770 ms HIGH), position markers at P0..P5 and P9.</summary>
     Marker
 }

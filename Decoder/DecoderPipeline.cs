@@ -15,13 +15,20 @@ namespace WwvDecoder.Decoder;
 ///   3. NotchFilter 60 Hz   - suppress US power-line fundamental
 ///   4. NotchFilter 120 Hz  - suppress power-line second harmonic
 ///   5. SynchronousDetector - coherent I/Q demodulation at 100 Hz -> envelope
+///   6. TickDetector        - detect 1000 Hz second ticks and minute pulse
 ///   7. PulseDetector       - classify pulse widths (Zero/One/Marker)
 ///   8. FrameDecoder        - assemble 60-bit BCD frames and decode UTC time
 ///
+/// Signal model (NIST IRIG-H positive-pulse):
+///   The 100 Hz subcarrier rises to full power ~30 ms after each 1 kHz second tick
+///   and holds HIGH for 170/470/770 ms (Zero/One/Marker). The pulse detector is
+///   tick-anchored: NotifyTick() backstops the previous pulse and opens a 200 ms
+///   rising-edge window for the next.
+///
 /// No carrier PLL: the 100 Hz subcarrier is derived from an atomic clock and its
-/// frequency is exact in the audio output of an AM receiver. Frequency correction
-/// is not needed. The synchronous detector runs at 2 Hz lowpass from the start;
-/// the adaptive LP widens to 8 Hz only when HF amplitude fading is detected.
+/// frequency is exact in the audio output of an AM receiver. The synchronous
+/// detector runs at 2 Hz lowpass from the start; the adaptive LP widens to 8 Hz
+/// only when HF amplitude fading is detected.
 ///
 /// All processing runs synchronously on the audio callback thread. UI updates
 /// are marshaled back to the UI thread by the FrameDecoder's callbacks.
@@ -126,7 +133,38 @@ public class DecoderPipeline
         _tickDetector.TickDetected += tick =>
         {
             if (tick.Type == TickType.SecondTick)
+            {
                 _syncScorer.ObserveSecondTick(Stopwatch.GetTimestamp());
+                // Save the current AGC level so BeginFastRecovery() can restore it after
+                // the minute pulse instead of resetting all the way to 1× gain.
+                _agc.SnapshotLevel();
+            }
+
+            // Notify the pulse detector of each second boundary so it can backstop
+            // any stuck pulse and arm the post-tick rising-edge detection window.
+            // For the minute pulse, open a 400 ms window (vs the normal 200 ms) because
+            // the 1000 Hz detector exits the 800 ms pulse ~190 ms before the true
+            // second-1 epoch, so the bit-1 100 Hz rising edge (at +1030 ms from anchor)
+            // arrives 220 ms after this early tick — outside a 200 ms window. The 400 ms
+            // window keeps detection open until +1210 ms, well past the rising edge.
+            // Math.Max inside NotifyTick ensures the false SecondTick that fires
+            // milliseconds later (BPF/LP ring-down) cannot shrink this extended window.
+            if (tick.Type == TickType.SecondTick || tick.Type == TickType.MinutePulse)
+                _pulseDetector.NotifyTick(_tickDetector.LevelHigh,
+                    windowMs: tick.Type == TickType.MinutePulse ? 400 : 200);
+
+            // After the minute pulse, reset all level trackers so bits 1–4 are not
+            // suppressed by the 800 ms pulse inflating the AGC and percentile reference.
+            // Order: NotifyTick() must read _tickDetector.LevelHigh first (above);
+            // TickDetector._levelHigh is zeroed by the TickDetected event (in TickDetector.cs);
+            // ClearLevelReference() and BeginFastRecovery() execute after that zero is applied.
+            if (tick.Type == TickType.MinutePulse)
+            {
+                _pulseDetector.ClearLevelReference();
+                var settings = _getSettings();
+                if (settings.EnableAgc)
+                    _agc.BeginFastRecovery();
+            }
 
             // Update tick cadence state and fire heartbeat for the UI indicator.
             if (tick.Type == TickType.SecondTick || tick.Type == TickType.MinutePulse)
@@ -147,13 +185,7 @@ public class DecoderPipeline
 
             _frameDecoder.OnTick(tick);
             if (tick.Type == TickType.MinutePulse)
-            {
-                // Abort any in-progress 100 Hz pulse so the P0 Marker can be
-                // detected fresh. Without this, the P59 pulse (or a stuck LOW
-                // state) overflows at the minute boundary and consumes P0.
-                _pulseDetector.AbortCurrentPulse();
                 MinutePulseDetected?.Invoke(tick.WidthSeconds);
-            }
         };
     }
 
@@ -186,7 +218,14 @@ public class DecoderPipeline
         // 5. Coherent I/Q demodulation -> 100 Hz envelope.
         var envelope = _syncDetector.ProcessBlock(n120Out);
 
-        // 6. Classify pulses using matched filter.
+        // 6. Detect 1000 Hz second ticks BEFORE classifying 100 Hz pulses.
+        // The tick fires synchronously mid-buffer inside ProcessBlock, calling
+        // NotifyTick() on the pulse detector. This arms the post-tick rising-edge
+        // window so that when ProcessBlock runs next (step 7), the 100 Hz carrier's
+        // rising edge (~30 ms after the tick) is already within the open window.
+        _tickDetector.ProcessBlock(n120Out);
+
+        // 7. Classify pulses using matched filter.
         _pulseDetector.ProcessBlock(envelope);
 
         // Feed the current envelope into the three-point discriminator so it can
@@ -207,9 +246,6 @@ public class DecoderPipeline
             _syncDetector.LowpassHz = shouldWiden ? WideLowpassHz : NarrowLowpassHz;
             _onLog?.Invoke($"[Adaptive LP] {(shouldWiden ? "Fading — LP→8 Hz" : "Stable — LP→2 Hz")}");
         }
-
-        // 9. Detect 1000 Hz second ticks and minute pulse on the separate channel.
-        _tickDetector.ProcessBlock(n120Out);
 
         // 10. Zero the signal meter if no pulse has arrived recently.
         _frameDecoder.CheckSignalTimeout();
@@ -427,6 +463,10 @@ public class DecoderPipeline
             ? 20 * Math.Log10(Math.Max(_agc.CurrentGain, 1e-9))
             : settings.InputTrimDb;
         status.TickState = _tickLockState;
+        // AGC gain well below 0 dB means the raw input is over-driven.
+        // Threshold: -6 dB (AGC had to cut signal to less than half) while AGC is active.
+        if (settings.EnableAgc && status.AgcGainDb < -6.0)
+            status.InputSaturationAlert = "Input level too high — reduce audio input volume";
         _onSignalUpdate(status);
     }
 
