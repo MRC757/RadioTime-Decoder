@@ -665,10 +665,14 @@ public class FrameDecoder
                 _diagAwaitingFirstSecondTick = false;
                 double gap        = TicksToSeconds(tickNow - _diagMinutePulseEndTick);
                 double roundError = elapsed - Math.Round(elapsed);
+                // Apply the fractional error as a correction to the anchor so that all
+                // subsequent bit windows in this frame are phase-aligned to true P0.
+                long correctionTicks = (long)(roundError * Stopwatch.Frequency);
+                _anchorWallTick += correctionTicks;
                 _onLog?.Invoke($"[Anchor diag] First SecondTick after MinutePulse: " +
                                $"gap={gap * 1000:F1}ms (expect ~200 ms), " +
                                $"elapsed-since-anchor={elapsed * 1000:F1}ms (expect ~1000 ms), " +
-                               $"round-error={roundError * 1000:+0.0;-0.0}ms, tickBit={tickBit} (expect 1)");
+                               $"round-error={roundError * 1000:+0.0;-0.0}ms → anchor corrected {correctionTicks * 1000.0 / Stopwatch.Frequency:+0.0;-0.0}ms, tickBit={tickBit} (expect 1)");
             }
 
             // Record arrival for tick-based fade detection regardless of whether this
@@ -1797,7 +1801,7 @@ public class FrameDecoder
 
     private void SeedAccumulatorField(int value, int[] positions, int[] weights)
     {
-        const double SeedStrength = 0.40;
+        const double SeedStrength = 0.55;
         const double SeedThreshold = 0.15;
         int remaining = value;
         for (int i = positions.Length - 1; i >= 0; i--)
