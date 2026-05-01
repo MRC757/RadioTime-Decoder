@@ -365,6 +365,8 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="8"/>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="8"/>
+                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
@@ -374,7 +376,7 @@
                     <ColumnDefinition Width="70"/>
                 </Grid.ColumnDefinitions>
 
-                <TextBlock Grid.Row="0" Grid.Column="0" Text="Signal Level" Style="{StaticResource LabelStyle}"/>
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="SNR" Style="{StaticResource LabelStyle}"/>
                 <ProgressBar Grid.Row="0" Grid.Column="1"
                              Value="{Binding SignalStrength, Mode=OneWay}"
                              Minimum="0" Maximum="100"
@@ -417,9 +419,22 @@
                                Foreground="{Binding LockState, Converter={StaticResource LockStateToColor}}"/>
                 </StackPanel>
 
+                <!-- Frame quality meter: mean soft-decision bit confidence for last completed frame -->
+                <TextBlock Grid.Row="6" Grid.Column="0" Text="Frame Quality" Style="{StaticResource LabelStyle}"/>
+                <ProgressBar Grid.Row="6" Grid.Column="1"
+                             Value="{Binding FrameQuality, Mode=OneWay}"
+                             Minimum="0" Maximum="100"
+                             Height="14" VerticalAlignment="Center"
+                             Background="#45475A" Foreground="#A6E3A1"
+                             BorderThickness="0"/>
+                <TextBlock Grid.Row="6" Grid.Column="2"
+                           Text="{Binding FrameQualityDisplay}"
+                           Style="{StaticResource LabelStyle}"
+                           HorizontalAlignment="Right"/>
+
                 <!-- 1 kHz tick lock indicator -->
-                <TextBlock Grid.Row="6" Grid.Column="0" Text="1 kHz Tick" Style="{StaticResource LabelStyle}"/>
-                <StackPanel Grid.Row="6" Grid.Column="1"
+                <TextBlock Grid.Row="8" Grid.Column="0" Text="1 kHz Tick" Style="{StaticResource LabelStyle}"/>
+                <StackPanel Grid.Row="8" Grid.Column="1"
                             Orientation="Horizontal" VerticalAlignment="Center">
                     <Ellipse Width="10" Height="10" Margin="0,0,7,0"
                              Fill="{Binding TickDotColor}"
@@ -430,7 +445,7 @@
                 </StackPanel>
 
                 <!-- Minute tone detected indicator -->
-                <StackPanel Grid.Row="6" Grid.Column="2"
+                <StackPanel Grid.Row="8" Grid.Column="2"
                             Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
                     <Ellipse Width="10" Height="10" Margin="0,0,5,0"
                              Fill="#89DCEB"
@@ -442,7 +457,7 @@
                 </StackPanel>
 
                 <!-- Receiver mode alert banner -->
-                <Border Grid.Row="7" Grid.ColumnSpan="3"
+                <Border Grid.Row="9" Grid.ColumnSpan="3"
                         Background="#F38BA8" CornerRadius="4" Padding="8,5"
                         Margin="0,8,0,0"
                         Visibility="{Binding ReceiverModeAlert, Converter={StaticResource NonEmptyToVisible}}">
@@ -455,7 +470,7 @@
                 </Border>
 
                 <!-- Input saturation alert banner -->
-                <Border Grid.Row="8" Grid.ColumnSpan="3"
+                <Border Grid.Row="10" Grid.ColumnSpan="3"
                         Background="#F9E2AF" CornerRadius="4" Padding="8,5"
                         Margin="0,4,0,0"
                         Visibility="{Binding InputSaturationAlert, Converter={StaticResource NonEmptyToVisible}}">

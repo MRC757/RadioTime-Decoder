@@ -2,10 +2,12 @@
 # RadioTime Decoder
 
 > [!NOTE]
-> Decoding under real HF propagation conditions depends on signal quality — ionospheric fading can corrupt 50–90% of each 60-bit frame, and decoded times may be absent or delayed during poor propagation. Do not use it as a time reference for anything safety-critical.
-> 
+> Decoding requires a minimum of **3 minutes** from a cold start (one 60-second frame to establish the anchor, two more to verify it). Actual time to first confirmed decode depends heavily on HF propagation conditions and signal quality — ionospheric fading can corrupt 50–90% of each 60-bit frame, and decoded times may be absent or significantly delayed during poor propagation. Do not use it as a time reference for anything safety-critical.
+
+> [!NOTE]
+> This application has only been tested with **WWV**. WWVH, BPM, and other stations that share the 100 Hz pulse-width BCD format are implemented but have not been verified against a live signal.
+
 <img width="1027" height="1324" alt="WWV Time decoder Screenshot" src="https://github.com/user-attachments/assets/6055d409-b556-4ed5-9cf5-0c3428f28fe4" />
-<img width="787" height="1345" alt="Screenshot 2026-04-17 222022" src="https://github.com/user-attachments/assets/99a63b3c-f924-4aab-bfe7-5c516873457f" />
 
 A Windows desktop application that decodes UTC time from HF radio time-signal stations (WWV, WWVH, BPM) by processing audio input in real time. Feed it audio from a shortwave receiver or online SDR tuned to a supported station and it will extract the BCD-encoded time, display decoded UTC, and optionally set your system clock.
 

@@ -103,6 +103,8 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     private double _signalStrength;
     private double _subcarrierStrength;
     private double _lockStrength;
+    private double _snrDb = double.NaN;
+    private double _frameQuality = double.NaN;
     private LockState _lockState = LockState.Searching;
     private string _countdownDisplay = "";
     private string _decodedTimeDisplay = "--:--:-- UTC";
@@ -530,9 +532,20 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         private set { _signalStrength = value; OnPropertyChanged(); OnPropertyChanged(nameof(SignalStrengthDb)); }
     }
 
-    public string SignalStrengthDb => _signalStrength > 0
-        ? $"{20 * Math.Log10(_signalStrength / 100.0):F1} dB"
-        : "--- dB";
+    // Show the actual SNR in dB (passed from the decoder) rather than a converted linear value.
+    public string SignalStrengthDb => double.IsNaN(_snrDb)
+        ? "--- dB"
+        : $"{_snrDb:F1} dB";
+
+    public double FrameQuality
+    {
+        get => double.IsNaN(_frameQuality) ? 0 : _frameQuality;
+        private set { _frameQuality = value; OnPropertyChanged(); OnPropertyChanged(nameof(FrameQualityDisplay)); }
+    }
+
+    public string FrameQualityDisplay => double.IsNaN(_frameQuality)
+        ? "---"
+        : $"{_frameQuality:F0}%";
 
     public double SubcarrierStrength
     {
@@ -682,6 +695,10 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             LockStrength = 0;
             SignalStrength = 0;
             SubcarrierStrength = 0;
+            _snrDb = double.NaN;
+            _frameQuality = double.NaN;
+            OnPropertyChanged(nameof(SignalStrengthDb));
+            FrameQuality = double.NaN;
             CountdownDisplay = "";
             DecodedTimeDisplay = "--:--:-- UTC";
             DecodedDateDisplay = "--- --, ----  ·  Day ---";
@@ -787,6 +804,13 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             SignalStrength = status.SignalStrengthPercent;
             SubcarrierStrength = status.SubcarrierStrengthPercent;
             LockStrength = status.LockStrengthPercent;
+            if (!double.IsNaN(status.SnrDb))
+            {
+                _snrDb = status.SnrDb;
+                OnPropertyChanged(nameof(SignalStrengthDb));
+            }
+            if (!double.IsNaN(status.FrameQualityPercent))
+                FrameQuality = status.FrameQualityPercent;
             LockState = status.LockState;
             SyncScore = status.SyncScorePercent;
             CoarseCarrierDisplay = status.SyncScorePercent >= 5
@@ -872,15 +896,23 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
 
             ConfidencePercent = Math.Min(100,
                 (frame.ConfidenceFrames / (double)TimeConfidenceThreshold) * 100);
+            string checkmark = frame.ConfidenceFrames >= TimeConfidenceThreshold ? " ✓" : "";
+            string lifetime  = frame.TotalLifetimeVerifications > 0
+                ? $"  ({frame.TotalLifetimeVerifications} total)"
+                : "";
             ConfidenceDisplay =
-                $"{Math.Min(frame.ConfidenceFrames, TimeConfidenceThreshold)} / {TimeConfidenceThreshold}";
+                $"{Math.Min(frame.ConfidenceFrames, TimeConfidenceThreshold)} / {TimeConfidenceThreshold}{checkmark}{lifetime}";
 
             OnPropertyChanged(nameof(CanSetClock));
 
             if (timeConfirmed)
                 Log($"Frame confirmed: {t:yyyy-MM-dd HH:mm:ss} UTC  DUT1={frame.Dut1Seconds:+0.0;-0.0}s");
             else if (frame.SlowFieldsConfident && !frame.HoursMinutesConfident)
-                Log($"Partial frame: date={t:yyyy-MM-dd} DOY={t.DayOfYear:D3} — time pending Markov verification");
+            {
+                int timePct = (int)Math.Round(frame.TimeFieldConfidence * 100);
+                Log($"Partial frame: date={t:yyyy-MM-dd} DOY={t.DayOfYear:D3} " +
+                    $"— time pending ({timePct}% time bits observed)");
+            }
             else
                 Log($"Frame decoded (unconfirmed {frame.ConfidenceFrames}/{TimeConfidenceThreshold}): " +
                     $"{t:yyyy-MM-dd HH:mm} UTC");
