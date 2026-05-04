@@ -46,7 +46,7 @@ public class SynchronousDetector
     // One biquad per channel (I and Q).
     private double _iW1, _iW2;  // I-channel delay-line state
     private double _qW1, _qW2;  // Q-channel delay-line state
-    private double _iOut, _qOut; // current biquad outputs (exposed to PLL and envelope)
+    private double _iOut, _qOut; // current biquad outputs (used for envelope = 2·√(I²+Q²))
 
     // Biquad coefficients (pre-normalised by a₀ = 1 + α).
     // Recomputed whenever LowpassHz changes.
@@ -78,18 +78,16 @@ public class SynchronousDetector
         }
     }
 
-    /// <summary>Two-pole lowpass in-phase output (read by CarrierPll for frequency estimation).</summary>
-    public double IFiltered => _iOut;
-
-    /// <summary>Two-pole lowpass quadrature output (read by CarrierPll for frequency estimation).</summary>
-    public double QFiltered => _qOut;
-
     // Noise floor tracking (identical asymmetric logic to EnvelopeDetector)
     private double _noiseFloor = 0.001;
     private int _noiseCounter;
     private readonly int _noiseInterval; // samples between noise floor updates (~100 ms)
 
-    public double NoiseFloor => _noiseFloor;
+    public double NoiseFloor
+    {
+        get => _noiseFloor;
+        set => _noiseFloor = Math.Max(value, 1e-6);
+    }
 
     public SynchronousDetector(int sampleRate, double subcarrierHz = 100.0, double lowpassHz = 8.0)
     {

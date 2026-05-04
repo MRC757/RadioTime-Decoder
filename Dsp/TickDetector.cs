@@ -37,7 +37,9 @@ public class TickDetector
     private readonly BandpassFilter _bandpass; // pre-filter to suppress out-of-band noise before IQ mixing
     private double _phase;
     private double _iFiltered, _qFiltered;
-    private readonly double _lpAlpha;     // 150 Hz single-pole IIR lowpass coefficient
+    private double _lpAlpha;               // single-pole IIR lowpass coefficient (adaptive)
+    private readonly double _lpAlphaNominal;  // 150 Hz nominal
+    private readonly double _lpAlphaWide;      // 300 Hz for multipath/fading
 
     // Noise floor: asymmetric tracker (fast fall, very slow rise) — same algorithm as
     // SynchronousDetector. Provides the floor for the bootstrap thresholds before
@@ -54,6 +56,14 @@ public class TickDetector
     private double _levelHigh;
     private readonly double _highAttack; // per-sample coefficient, applied during pulse
     private readonly double _highDecay;  // per-sample coefficient, applied between pulses
+
+    // Post-minute recovery reference. The 800 ms P0 burst can leave both _levelHigh and
+    // the noise floor too high for the first 5 ms tick to cross threshold. Keep the last
+    // clean second-tick reference and temporarily threshold against it after P0.
+    private double _preMinuteLevelSnapshot;
+    private double _preMinuteNoiseSnapshot = 0.001;
+    private bool _hasPreMinuteSnapshot;
+    private int _postMinuteRecoverySamples;
 
     // Pulse detection state
     private bool _inPulse;
@@ -75,8 +85,29 @@ public class TickDetector
     public double CurrentEnvelope { get; private set; }
     public double LevelHigh  => _levelHigh;
     public double NoiseFloor => _noiseFloor;
+    public bool IsPostMinuteRecoveryActive => _postMinuteRecoverySamples > 0;
+    public Action<string>? OnLog { get; set; }
+
+    // Adaptive lowpass bandwidth: nominal 150 Hz in clean conditions,
+    // widens to 300 Hz during HF multipath/fading to track envelope faster.
+    private bool _lpWidened;
+    public bool IsLowpassWidened
+    {
+        get => _lpWidened;
+        set
+        {
+            if (value != _lpWidened)
+            {
+                _lpWidened = value;
+                _lpAlpha = value ? _lpAlphaWide : _lpAlphaNominal;
+                OnLog?.Invoke($"[TickDetector] Lowpass {(value ? "widened to 300 Hz (fading)" : "narrowed to 150 Hz (stable)")}");
+            }
+        }
+    }
 
     public event Action<TickEvent>? TickDetected;
+
+    private readonly int _minPostMinuteTickSamples; // ignore P0 ring-down before real second 1
 
     /// <param name="sampleRate">Audio sample rate in Hz.</param>
     /// <param name="carrierHz">Tone carrier frequency. 1000 Hz for WWV, 1200 Hz for WWVH.</param>
@@ -91,10 +122,14 @@ public class TickDetector
         // survives ±10 Hz SDR LO error with > 3 dB headroom.
         _bandpass = new BandpassFilter(sampleRate, carrierHz, bandwidthHz: 80.0);
 
-        // 150 Hz lowpass: RC = 1/(2π·150) ≈ 1.06 ms
-        double rc = 1.0 / (2.0 * Math.PI * 150.0);
+        // Nominal lowpass: 150 Hz (RC ≈ 1.06 ms) for stable SNR in clean conditions.
+        // Widens to 300 Hz during HF multipath/fading to track envelope changes faster.
         double dt = 1.0 / sampleRate;
-        _lpAlpha = dt / (rc + dt);
+        double rcNominal = 1.0 / (2.0 * Math.PI * 150.0);
+        double rcWide    = 1.0 / (2.0 * Math.PI * 300.0);
+        _lpAlphaNominal = dt / (rcNominal + dt);
+        _lpAlphaWide    = dt / (rcWide + dt);
+        _lpAlpha        = _lpAlphaNominal;
 
         _highAttack = 1.0 - Math.Exp(-1.0 / (0.002 * sampleRate)); // 2 ms
         _highDecay  = Math.Exp(-1.0 / (3.000 * sampleRate));        // 3 s
@@ -106,6 +141,7 @@ public class TickDetector
         _noiseInterval           = sampleRate / 10;          // 100 ms
         _minCadenceSamples       = sampleRate / 2;           // 500 ms (SecondTick)
         _minMinuteCadenceSamples = sampleRate * 50;          // 50 s   (MinutePulse)
+        _minPostMinuteTickSamples = sampleRate * 80 / 1000;  // 80 ms  (P0 ring-down guard)
         // Pre-prime so the very first legitimate events are not suppressed.
         _samplesSinceLastEmit         = _minCadenceSamples;
         _samplesSinceLastMinutePulse  = _minMinuteCadenceSamples;
@@ -119,10 +155,16 @@ public class TickDetector
         _noiseFloor = 0.001;
         _noiseCounter = 0;
         _levelHigh = 0;
+        _preMinuteLevelSnapshot = 0;
+        _preMinuteNoiseSnapshot = 0.001;
+        _hasPreMinuteSnapshot = false;
+        _postMinuteRecoverySamples = 0;
         _inPulse = false;
         _pulseSamples = 0;
         _samplesSinceLastEmit        = _minCadenceSamples;
         _samplesSinceLastMinutePulse = _minMinuteCadenceSamples;
+        _lpWidened = false;
+        _lpAlpha = _lpAlphaNominal;
     }
 
     public void ProcessBlock(float[] input)
@@ -178,8 +220,27 @@ public class TickDetector
             if (_samplesSinceLastMinutePulse < _minMinuteCadenceSamples)
                 _samplesSinceLastMinutePulse++;
 
-            double enterThreshold = Math.Max(_levelHigh * 0.50, _noiseFloor * 8.0);
-            double exitThreshold  = Math.Max(_levelHigh * 0.25, _noiseFloor * 4.0);
+            if (_postMinuteRecoverySamples > 0)
+            {
+                _postMinuteRecoverySamples--;
+                if (_postMinuteRecoverySamples == 0)
+                {
+                    OnLog?.Invoke("[TickDetector] Post-minute reference recovery expired");
+                }
+            }
+
+            double thresholdLevel = _levelHigh;
+            double thresholdNoise = _noiseFloor;
+            if (_postMinuteRecoverySamples > 0 && _hasPreMinuteSnapshot)
+            {
+                // Clamp stale snapshots so they cannot pin thresholds after a real level change.
+                double maxFromCurrent = Math.Max(_levelHigh, 1e-6) * 4.0;
+                thresholdLevel = Math.Clamp(_preMinuteLevelSnapshot, 1e-6, maxFromCurrent);
+                thresholdNoise = Math.Min(_noiseFloor, _preMinuteNoiseSnapshot);
+            }
+
+            double enterThreshold = Math.Max(thresholdLevel * 0.50, thresholdNoise * 8.0);
+            double exitThreshold  = Math.Max(thresholdLevel * 0.25, thresholdNoise * 4.0);
 
             if (!_inPulse)
             {
@@ -223,9 +284,13 @@ public class TickDetector
                         //     Real WWV fires exactly once per minute. Anything within 50 s
                         //     is SDR audio energy (voice, noise) whose 1000 Hz envelope
                         //     wanders above threshold for ~800 ms bursts, mimicking the pulse.
+                        bool tooEarlyAfterMinute = type == TickType.SecondTick
+                            && _postMinuteRecoverySamples > 0
+                            && _samplesSinceLastMinutePulse < _minPostMinuteTickSamples;
                         bool allowed = type switch
                         {
-                            TickType.SecondTick  => _samplesSinceLastEmit >= _minCadenceSamples,
+                            TickType.SecondTick  => !tooEarlyAfterMinute
+                                                 && _samplesSinceLastEmit >= _minCadenceSamples,
                             TickType.MinutePulse => _samplesSinceLastMinutePulse >= _minMinuteCadenceSamples,
                             _                    => false
                         };
@@ -233,7 +298,10 @@ public class TickDetector
                         {
                             TickDetected?.Invoke(new TickEvent(type.Value, widthSeconds));
                             if (type == TickType.SecondTick)
+                            {
                                 _samplesSinceLastEmit = 0;
+                                SnapshotPreMinuteReference();
+                            }
                             if (type == TickType.MinutePulse)
                             {
                                 _samplesSinceLastMinutePulse = 0;
@@ -242,7 +310,7 @@ public class TickDetector
                                 // _levelHigh) for ~4 s while the 3 s decay runs. Zeroing here forces
                                 // the threshold to fall back to 8× noiseFloor so the very next tick
                                 // (second 1, ~144 ms after pulse end) is detected and retrains the level.
-                                _levelHigh = 0;
+                                BeginPostMinuteRecovery();
                             }
                         }
                     }
@@ -255,6 +323,31 @@ public class TickDetector
                 }
             }
         }
+    }
+
+    private void SnapshotPreMinuteReference()
+    {
+        if (_levelHigh <= 0) return;
+        _preMinuteLevelSnapshot = _levelHigh;
+        _preMinuteNoiseSnapshot = _noiseFloor;
+        _hasPreMinuteSnapshot = true;
+    }
+
+    private void BeginPostMinuteRecovery()
+    {
+        const double recoverySeconds = 0.50;
+        _postMinuteRecoverySamples = (int)Math.Round(recoverySeconds * _sampleRate);
+
+        // The 800 ms minute pulse drives _levelHigh to its full amplitude. Restore the
+        // previous second-tick reference if available; otherwise clear it so thresholding
+        // falls back to the quiet noise floor rather than the burst amplitude.
+        _levelHigh = _hasPreMinuteSnapshot ? _preMinuteLevelSnapshot : 0.0;
+        if (_hasPreMinuteSnapshot)
+            _noiseFloor = Math.Min(_noiseFloor, _preMinuteNoiseSnapshot);
+
+        OnLog?.Invoke(_hasPreMinuteSnapshot
+            ? $"[TickDetector] Post-minute reference restored: level={_levelHigh:F4}, noise={_noiseFloor:F6} for {recoverySeconds * 1000:F0}ms"
+            : $"[TickDetector] Post-minute reference cleared: no pre-burst snapshot, recovery {recoverySeconds * 1000:F0}ms");
     }
 }
 

@@ -35,7 +35,6 @@ public sealed class DiagnosticLogger : IDisposable
             "agc_gain_db,agc_level,input_rms_db," +
             "notch60_in_db,notch60_out_db,notch60_rej_db," +
             "notch120_in_db,notch120_out_db,notch120_rej_db," +
-            "ale_in_rms_db,ale_out_rms_db,ale_improvement_db,ale_weight_norm," +
             "envelope,noise_floor,snr_db," +
             "lp_hz," +
             "level_high,peak_envelope,is_fading,is_amplitude_unstable,amplitude_variability," +
@@ -50,7 +49,8 @@ public sealed class DiagnosticLogger : IDisposable
         _frameWriter = OpenCsv(Path.Combine(dir, $"diag-frames-{date}.csv"),
             "timestamp_utc,elapsed_s," +
             "decoded_utc,day_of_year,dut1_s,dst_active,leap_pending," +
-            "confidence_frames,is_valid");
+            "confidence_frames,is_valid,slow_fields_confident,hours_minutes_confident," +
+            "time_field_confidence,direct_time_bits,gap_filled_time_bits,markov_passed,clock_drift_s");
     }
 
     public double ElapsedSeconds =>
@@ -68,7 +68,6 @@ public sealed class DiagnosticLogger : IDisposable
                     $"{m.AgcGainDb:F2},{m.AgcLevel:F6},{m.InputRmsDb:F2}," +
                     $"{m.Notch60InDb:F2},{m.Notch60OutDb:F2},{m.Notch60RejDb:F2}," +
                     $"{m.Notch120InDb:F2},{m.Notch120OutDb:F2},{m.Notch120RejDb:F2}," +
-                    $"{m.AleInRmsDb:F2},{m.AleOutRmsDb:F2},{m.AleImprovementDb:F2},{m.AleWeightNorm:F4}," +
                     $"{m.Envelope:F6},{m.NoiseFloor:F6},{m.SnrDb:F2}," +
                     $"{m.LpHz:F1}," +
                     $"{m.LevelHigh:F6},{m.PeakEnvelope:F6}," +
@@ -105,7 +104,10 @@ public sealed class DiagnosticLogger : IDisposable
                     $"{f.TimestampUtc},{f.ElapsedSeconds:F2}," +
                     $"{f.DecodedUtc},{f.DayOfYear},{f.Dut1Seconds:F1}," +
                     $"{B(f.DstActive)},{B(f.LeapPending)}," +
-                    $"{f.ConfidenceFrames},{B(f.IsValid)}");
+                    $"{f.ConfidenceFrames},{B(f.IsValid)},{B(f.SlowFieldsConfident)}," +
+                    $"{B(f.HoursMinutesConfident)},{f.TimeFieldConfidence:F3}," +
+                    $"{f.DirectTimeBits},{f.GapFilledTimeBits},{B(f.MarkovPassed)}," +
+                    $"{(f.ClockDriftSeconds.HasValue ? f.ClockDriftSeconds.Value.ToString("F1") : "")}");
             }
             catch { }
         }
@@ -159,11 +161,6 @@ public record DiagBlockMetrics(
     double Notch120InDb,
     double Notch120OutDb,
     double Notch120RejDb,
-    // ALE
-    double AleInRmsDb,
-    double AleOutRmsDb,
-    double AleImprovementDb,
-    double AleWeightNorm,
     // Synchronous detector
     double Envelope,
     double NoiseFloor,
@@ -207,4 +204,11 @@ public record DiagFrameRecord(
     bool DstActive,
     bool LeapPending,
     int ConfidenceFrames,
-    bool IsValid);
+    bool IsValid,
+    bool SlowFieldsConfident,
+    bool HoursMinutesConfident,
+    float TimeFieldConfidence,
+    int DirectTimeBits,
+    int GapFilledTimeBits,
+    bool MarkovPassed,
+    double? ClockDriftSeconds);

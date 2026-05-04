@@ -45,17 +45,25 @@ public class DecoderPipeline
     private readonly SynchronousDetector _syncDetector;
     private readonly PulseDetector _pulseDetector;
     private readonly TickDetector _tickDetector;
+    private readonly SecondTickPll _secondTickPll;
     private readonly SyncQualityScorer _syncScorer;
     private readonly FrameDecoder _frameDecoder;
     private readonly Action<string>? _onLog;
     private readonly Action<SignalStatus> _onSignalUpdate;
     private readonly Func<DecoderRuntimeSettingsSnapshot> _getSettings;
+    private readonly Func<long> _getTimestamp;
     private readonly DiagnosticLogger? _diag;
 
     // Periodic status log every ~5 s (100 blocks × 50 ms).
     private int _blockCount;
     // Tracks whether the LP filter has been widened for fading conditions.
     private bool _lpWidened;
+
+    // Pre-minute-pulse noise floor snapshot.
+    // Updated every SecondTick so it holds the quiet-period floor from the second
+    // just before P0. Restored after the 800 ms burst so ticks 1–3 are detectable
+    // against the correct baseline rather than the burst-inflated floor.
+    private double _preMinutePulseNoiseFloor = 0.001;
 
     // ── 1 kHz tick cadence tracking ──────────────────────────────────────────
     // Derives TickLockState from the regularity of SecondTick/MinutePulse events:
@@ -65,6 +73,12 @@ public class DecoderPipeline
     private long _lastTickTimestamp;
     private int _consecutiveGoodTicks;
     private TickLockState _tickLockState = TickLockState.NoSignal;
+
+    // ── Predictive tick generation during signal fades ──────────────────────
+    // When the 1 kHz signal fades (PLL in FadingOut state), synthesize ticks
+    // at the PLL's expected timing to keep the frame decoder advancing while
+    // awaiting signal recovery. Eliminates the 5+ second recovery period.
+    private long _lastGeneratedSyntheticTickTime;
 
     // ── Diagnostic accumulation buffers ──────────────────────────────────────
     // Intermediate signal stages are copied here on each block. Every
@@ -93,7 +107,8 @@ public class DecoderPipeline
             EnableAgc: true,
             EnableAdaptiveLowpass: true,
             InputTrimDb: 0.0));
-        _diag = diagnosticLogger;
+        _getTimestamp   = getTimestamp ?? Stopwatch.GetTimestamp;
+        _diag           = diagnosticLogger;
 
         // Pre-allocate diagnostic buffers sized for 1 second of audio.
         int diagBufSize = sr;
@@ -111,9 +126,10 @@ public class DecoderPipeline
         // is exact in AM-demodulated audio — no frequency correction needed.
         // Adaptive LP widens to 8 Hz only when HF amplitude fading is detected.
         _syncDetector = new SynchronousDetector(sr, subcarrierHz: 100.0, lowpassHz: NarrowLowpassHz);
-        _pulseDetector = new PulseDetector(sr, _syncDetector) { OnLog = onLog };
-        _tickDetector  = new TickDetector(sr);
-        _syncScorer    = new SyncQualityScorer(sr);
+        _pulseDetector  = new PulseDetector(sr, _syncDetector) { OnLog = onLog };
+        _tickDetector   = new TickDetector(sr) { OnLog = onLog };
+        _secondTickPll  = new SecondTickPll(onLog);
+        _syncScorer     = new SyncQualityScorer(sr);
         _frameDecoder  = new FrameDecoder(ForwardSignalUpdate,
             frame =>
             {
@@ -132,12 +148,59 @@ public class DecoderPipeline
 
         _tickDetector.TickDetected += tick =>
         {
+            long now = _getTimestamp();
+
             if (tick.Type == TickType.SecondTick)
             {
-                _syncScorer.ObserveSecondTick(Stopwatch.GetTimestamp());
-                // Save the current AGC level so BeginFastRecovery() can restore it after
-                // the minute pulse instead of resetting all the way to 1× gain.
-                _agc.SnapshotLevel();
+                // Check whether this tick falls in the WWV voice-announcement window
+                // (seconds 52–59) or at a NIST-omitted position (29, 59).
+                // WWV broadcasts a voice announcement starting ~52 s into each minute;
+                // the 1000 Hz channel carries real energy from voice audio that can
+                // trigger false SecondTick detections, corrupting the PLL phase.
+                // Per NIST, no 1000 Hz tick is broadcast at seconds 29 or 59 — any
+                // detection there is definitionally false.
+                //
+                // Voice-window ticks bypass the PLL to protect its phase estimate,
+                // but still reach NotifyTick() and FrameDecoder.OnTick() so the 100 Hz
+                // BCD rising-edge window is armed and bit position snap still works.
+                int secondIdx = _frameDecoder.GetCurrentSecondIndex();
+                bool inVoiceWindow = secondIdx >= 52; // seconds 52–59: voice announcement
+                bool isNistOmitted = secondIdx == 29 || secondIdx == 59;
+
+                if (inVoiceWindow)
+                {
+                    // Bypass PLL — do not let voice-induced ticks corrupt the phase estimate.
+                    // Still update level snapshot so minute-pulse recovery baseline is current.
+                    if (isNistOmitted)
+                        _onLog?.Invoke($"[Tick] Spurious 1kHz at second {secondIdx} (NIST omits tick here; likely voice) — PLL bypassed");
+                    _agc.SnapshotLevel();
+                    _preMinutePulseNoiseFloor = _syncDetector.NoiseFloor;
+                }
+                else
+                {
+                    // Normal path: route through the PLL for glitch rejection.
+                    // The most important rejection is the BPF/LP ring-down spurious tick that
+                    // fires ~20 ms after the P0 minute pulse ends. The PLL, once locked,
+                    // expects the next tick ~200 ms after P0 end; the spurious tick is ~180 ms
+                    // early — outside the ±150 ms lock gate — and is silently discarded here.
+                    // NIST omits the 1 kHz tick at positions 29 and 59.
+                    // Tell the PLL to advance by 2 s when we're at the preceding position
+                    // (28 or 58) so it doesn't lose lock waiting for a tick that won't come.
+                    bool nextOmitted = secondIdx == 28 || secondIdx == 58;
+                    long? pllTs = _secondTickPll.SubmitSecondTick(now, nextOmitted);
+                    if (pllTs == null) return; // rejected as glitch — do not forward downstream
+                    now = pllTs.Value;
+
+                    _syncScorer.ObserveSecondTick(now);
+                    _agc.SnapshotLevel();
+                    _preMinutePulseNoiseFloor = _syncDetector.NoiseFloor;
+                }
+            }
+            else if (tick.Type == TickType.MinutePulse)
+            {
+                // Seed the PLL from the cesium-accurate P0 end timestamp so it can predict
+                // exactly where tick 1 should arrive (~200 ms later for an 800 ms pulse).
+                _secondTickPll.SeedFromMinutePulse(tick.WidthSeconds, now);
             }
 
             // Notify the pulse detector of each second boundary so it can backstop
@@ -147,8 +210,6 @@ public class DecoderPipeline
             // second-1 epoch, so the bit-1 100 Hz rising edge (at +1030 ms from anchor)
             // arrives 220 ms after this early tick — outside a 200 ms window. The 400 ms
             // window keeps detection open until +1210 ms, well past the rising edge.
-            // Math.Max inside NotifyTick ensures the false SecondTick that fires
-            // milliseconds later (BPF/LP ring-down) cannot shrink this extended window.
             if (tick.Type == TickType.SecondTick || tick.Type == TickType.MinutePulse)
                 _pulseDetector.NotifyTick(_tickDetector.LevelHigh,
                     windowMs: tick.Type == TickType.MinutePulse ? 400 : 200);
@@ -161,6 +222,10 @@ public class DecoderPipeline
             if (tick.Type == TickType.MinutePulse)
             {
                 _pulseDetector.ClearLevelReference();
+                // Restore noise floor to the pre-burst quiet-period level so that
+                // ticks 1–3 (~200 ms after P0 end) are detectable against the correct
+                // baseline rather than the 800 ms burst-inflated floor.
+                _syncDetector.NoiseFloor = _preMinutePulseNoiseFloor;
                 var settings = _getSettings();
                 if (settings.EnableAgc)
                     _agc.BeginFastRecovery();
@@ -169,7 +234,6 @@ public class DecoderPipeline
             // Update tick cadence state and fire heartbeat for the UI indicator.
             if (tick.Type == TickType.SecondTick || tick.Type == TickType.MinutePulse)
             {
-                long now = Stopwatch.GetTimestamp();
                 if (_lastTickTimestamp != 0)
                 {
                     double dt = (double)(now - _lastTickTimestamp) / Stopwatch.Frequency;
@@ -185,7 +249,7 @@ public class DecoderPipeline
 
             _frameDecoder.OnTick(tick);
             if (tick.Type == TickType.MinutePulse)
-                MinutePulseDetected?.Invoke(tick.WidthSeconds);
+                MinutePulseDetected?.Invoke(tick.WidthSeconds, DateTime.UtcNow);
         };
     }
 
@@ -236,19 +300,39 @@ public class DecoderPipeline
             _pulseDetector.LevelHigh,
             Stopwatch.GetTimestamp());
 
-        // Adaptive LP: start narrow (2 Hz) for best SNR. Widen to 8 Hz only when
-        // rapid HF amplitude fading is detected so the envelope can follow the
-        // instantaneous carrier level. Reverts to 2 Hz once fading subsides.
+        // Adaptive LP: start narrow for best SNR. Widen only when
+        // rapid HF amplitude fading is detected so envelopes can follow
+        // instantaneous carrier level. Reverts to narrow once fading subsides.
         bool shouldWiden = settings.EnableAdaptiveLowpass && _pulseDetector.IsAmplitudeUnstable;
         if (shouldWiden != _lpWidened)
         {
             _lpWidened = shouldWiden;
             _syncDetector.LowpassHz = shouldWiden ? WideLowpassHz : NarrowLowpassHz;
-            _onLog?.Invoke($"[Adaptive LP] {(shouldWiden ? "Fading — LP→8 Hz" : "Stable — LP→2 Hz")}");
+            _tickDetector.IsLowpassWidened = shouldWiden;
+            _onLog?.Invoke($"[Adaptive LP] {(shouldWiden ? "Fading — Widen LP" : "Stable — Narrow LP")}");
         }
 
         // 10. Zero the signal meter if no pulse has arrived recently.
         _frameDecoder.CheckSignalTimeout();
+
+        // 11. Generate predictive ticks during fade periods to keep frame decoder advancing.
+        // When the PLL loses lock due to HF fading, it enters FadingOut state and generates
+        // synthetic tick expectations at 1000 ms intervals. This allows rapid recovery when
+        // the signal returns, eliminating the 5+ second wait for 5 consecutive real ticks.
+        long now = _getTimestamp();
+        if (_secondTickPll.IsFadingOut)
+        {
+            long? syntheticTs = _secondTickPll.GeneratePredictiveSecondTick(now);
+            if (syntheticTs != null)
+            {
+                // Process synthetic tick through the frame decoder (but not the pulse detector,
+                // since there is no real 100 Hz pulse during a complete fade).
+                var syntheticTick = new TickEvent(TickType.SecondTick, 0.005); // nominal 5 ms tick
+                _frameDecoder.OnTick(syntheticTick);
+                _lastGeneratedSyntheticTickTime = syntheticTs.Value;
+                _onLog?.Invoke($"[TickPLL] Generated predictive SecondTick");
+            }
+        }
 
         // Decay tick lock state to NoSignal if no tick has arrived for 7 seconds.
         if (_lastTickTimestamp != 0 &&
@@ -287,9 +371,11 @@ public class DecoderPipeline
 
     /// <summary>
     /// Fires on the audio callback thread each time the 1000 Hz minute pulse ends.
-    /// The argument is the measured pulse width in seconds (~0.8 s for a genuine WWV pulse).
+    /// Arguments: pulse width in seconds (~0.8 s), and the UTC timestamp captured on the
+    /// audio thread at the moment of detection (use this instead of DateTime.UtcNow in
+    /// dispatcher-deferred handlers to avoid accumulating dispatcher-queue delay).
     /// </summary>
-    public event Action<double>? MinutePulseDetected;
+    public event Action<double, DateTime>? MinutePulseDetected;
 
     /// <summary>
     /// Fires on the audio callback thread each time a 1 kHz second tick is confirmed.
@@ -313,6 +399,7 @@ public class DecoderPipeline
         _syncDetector.Reset();
         _pulseDetector.Reset();
         _tickDetector.Reset();
+        _secondTickPll.Reset();
         _syncScorer.Reset();
         _frameDecoder.Reset();
         _lpWidened = false;
@@ -349,8 +436,6 @@ public class DecoderPipeline
         double notch60OutDb  = GoertzelDb(_diagN60, n, 60.0,  sr);
         double notch120InDb  = GoertzelDb(_diagN60,  n, 120.0, sr);
         double notch120OutDb = GoertzelDb(_diagN120, n, 120.0, sr);
-        double aleInDb       = RmsDb(_diagN120, n);
-        double aleOutDb      = aleInDb;
 
         double gainDb = settings.EnableAgc
             ? 20 * Math.Log10(Math.Max(_agc.CurrentGain, 1e-9))
@@ -367,14 +452,10 @@ public class DecoderPipeline
             InputRmsDb:           inputRmsDb,
             Notch60InDb:          notch60InDb,
             Notch60OutDb:         notch60OutDb,
-            Notch60RejDb:         notch60InDb  - notch60OutDb,
+            Notch60RejDb:         Math.Max(0.0, notch60InDb  - notch60OutDb),
             Notch120InDb:         notch120InDb,
             Notch120OutDb:        notch120OutDb,
-            Notch120RejDb:        notch120InDb - notch120OutDb,
-            AleInRmsDb:           aleInDb,
-            AleOutRmsDb:          aleOutDb,
-            AleImprovementDb:     aleInDb - aleOutDb,
-            AleWeightNorm:        0.0,
+            Notch120RejDb:        Math.Max(0.0, notch120InDb - notch120OutDb),
             Envelope:             envelope,
             NoiseFloor:           noiseFloor,
             SnrDb:                snrDb,
@@ -425,7 +506,14 @@ public class DecoderPipeline
             DstActive:        frame.DstActive,
             LeapPending:      frame.LeapSecondPending,
             ConfidenceFrames: frame.ConfidenceFrames,
-            IsValid:          frame.IsValid);
+            IsValid:          frame.IsValid,
+            SlowFieldsConfident: frame.SlowFieldsConfident,
+            HoursMinutesConfident: frame.HoursMinutesConfident,
+            TimeFieldConfidence: frame.TimeFieldConfidence,
+            DirectTimeBits: frame.DirectTimeBits,
+            GapFilledTimeBits: frame.GapFilledTimeBits,
+            MarkovPassed: frame.MarkovPassed,
+            ClockDriftSeconds: frame.ClockDriftSeconds);
     }
 
     /// <summary>Goertzel spectral power at <paramref name="targetHz"/> over the first

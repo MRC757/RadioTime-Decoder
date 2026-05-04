@@ -496,7 +496,8 @@
                         <ColumnDefinition Width="70"/>
                     </Grid.ColumnDefinitions>
 
-                    <TextBlock Grid.Column="0" Text="Input Trim" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock Grid.Column="0" Text="Input Trim" Style="{StaticResource LabelStyle}"
+                               ToolTip="Static gain offset applied before AGC. Only has effect when AGC is disabled."/>
                     <Slider Grid.Column="1"
                             Minimum="-24" Maximum="24"
                             TickFrequency="6"
@@ -730,6 +731,7 @@
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
@@ -750,13 +752,19 @@
                     IsEnabled="{Binding CanSetClock}"/>
 
             <TextBlock Grid.Row="1" Grid.ColumnSpan="3"
-                       Text="Set System Clock adjusts UTC — Windows automatically displays your local time based on timezone settings."
-                       FontSize="10" Foreground="#6C7086"
+                       Text="{Binding ClockSetStatusText}"
+                       FontSize="10" Foreground="#A6E3A1"
                        TextAlignment="Center" TextWrapping="Wrap"
                        Margin="0,5,0,0"/>
 
+            <TextBlock Grid.Row="2" Grid.ColumnSpan="3"
+                       Text="Set System Clock adjusts UTC — Windows automatically displays your local time based on timezone settings."
+                       FontSize="10" Foreground="#6C7086"
+                       TextAlignment="Center" TextWrapping="Wrap"
+                       Margin="0,3,0,0"/>
+
             <!-- Minute-start sync for HF digital modes -->
-            <Border Grid.Row="2" Grid.ColumnSpan="3"
+            <Border Grid.Row="3" Grid.ColumnSpan="3"
                     Background="#2A2A3E" CornerRadius="5" Padding="10,7"
                     Margin="0,8,0,0">
                 <StackPanel>

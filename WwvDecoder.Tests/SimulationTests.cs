@@ -36,8 +36,8 @@ public class SimulationTests
             onLog:          msg => log.Add(msg),
             getTimestamp:   SimTimestamp);
 
-        // 4 minutes: enough for ALE convergence (~1-2 s) + P0→P1 anchor (~9 s)
-        // + frame collection (~50 s) + possible second frame for Locked state.
+        // 4 minutes: enough for P0→P1 anchor (~9 s) + frame collection (~50 s)
+        // + possible second frame for Locked state.
         int maxBlocks = 4 * 60 * 20;
         for (int b = 0; b < maxBlocks && decoded == null; b++)
         {

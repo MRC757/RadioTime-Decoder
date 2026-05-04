@@ -308,7 +308,8 @@ public class PulseDetector
                     _pulseSamples = 1;
                     _gapSamples   = 0;
                     _tickWindowSamples = 0;
-                    _levelHighAtPulseStart = _levelHighPct > 0 ? _levelHighPct : _levelHigh;
+                    double effectiveRef = _levelHighPct > 0 ? _levelHighPct : _levelHigh;
+                    _levelHighAtPulseStart = Math.Min(effectiveRef, _levelHigh * 1.5);
                     _pulseBuffer.Clear();
                     _pulseBuffer.Add(sample);
                 }

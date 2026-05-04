@@ -40,5 +40,17 @@ public class TimeFrame
     /// </summary>
     public float TimeFieldConfidence { get; set; }
 
+    /// <summary>Number of hour+minute BCD bits directly observed in this frame.</summary>
+    public int DirectTimeBits { get; set; }
+
+    /// <summary>Number of hour+minute BCD bits filled as erasures/estimates.</summary>
+    public int GapFilledTimeBits { get; set; }
+
+    /// <summary>Clock drift from the Markov expected time in seconds, when available.</summary>
+    public double? ClockDriftSeconds { get; set; }
+
+    /// <summary>True when this frame established, promoted, or passed the Markov clock check.</summary>
+    public bool MarkovPassed { get; set; }
+
     public static TimeFrame Invalid => new() { IsValid = false };
 }

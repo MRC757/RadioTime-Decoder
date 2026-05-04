@@ -8,6 +8,55 @@ public class DiagnosticTests
     private const int Sr = 22050;
 
     [Fact]
+    public void TickDetector_RestoresPreBurstReference_AfterMinutePulse()
+    {
+        var tick = new TickDetector(Sr);
+        var events = new List<TickEvent>();
+        var logs = new List<string>();
+        tick.TickDetected += events.Add;
+        tick.OnLog = logs.Add;
+
+        double phase = 0;
+        float[] Tone(double seconds, double amp)
+        {
+            int n = (int)Math.Round(seconds * Sr);
+            var buf = new float[n];
+            double omega = 2.0 * Math.PI * 1000.0 / Sr;
+            for (int i = 0; i < n; i++)
+            {
+                buf[i] = (float)(amp * Math.Sin(phase));
+                phase += omega;
+                if (phase >= Math.PI * 2) phase -= Math.PI * 2;
+            }
+            return buf;
+        }
+        static float[] Silence(double seconds) => new float[(int)Math.Round(seconds * Sr)];
+
+        // Establish a clean second-tick reference at modest amplitude.
+        tick.ProcessBlock(Tone(0.005, 0.20));
+        tick.ProcessBlock(Silence(1.0));
+        Assert.Contains(events, e => e.Type == TickType.SecondTick);
+
+        // A much larger 800 ms P0 burst would normally inflate _levelHigh enough to
+        // suppress the first modest 5 ms tick. The detector should restore the saved
+        // pre-burst reference for the first 500 ms after P0.
+        tick.ProcessBlock(Tone(0.800, 1.00));
+        tick.ProcessBlock(Silence(0.050));
+        Assert.Contains(events, e => e.Type == TickType.MinutePulse);
+        Assert.True(tick.IsPostMinuteRecoveryActive);
+        Assert.Contains(logs, l => l.Contains("Post-minute reference restored"));
+
+        int secondTicksBefore = events.Count(e => e.Type == TickType.SecondTick);
+        tick.ProcessBlock(Silence(0.150));
+        tick.ProcessBlock(Tone(0.005, 0.20));
+        tick.ProcessBlock(Silence(0.200));
+
+        Assert.True(events.Count(e => e.Type == TickType.SecondTick) > secondTicksBefore,
+            string.Join(Environment.NewLine, logs) + Environment.NewLine +
+            string.Join(Environment.NewLine, events.Select(e => $"{e.Type} {e.WidthSeconds * 1000:F1}ms")));
+    }
+
+    [Fact]
     public void FullPipeline_DetectsPulsesWithinThirtySeconds()
     {
         // Verify the full DSP chain (AGC → SyncDet → TickDetector → PulseDetector) detects

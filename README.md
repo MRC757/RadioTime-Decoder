@@ -41,11 +41,11 @@ Built with WPF (.NET 9) and the MVVM pattern. Dark-themed UI with real-time sign
 - **100 Hz level meter** showing the strength of the filtered subcarrier specifically
 - **Lock quality indicator** showing decoder synchronization progress (Searching → Syncing → Locked)
 - **Frame countdown** — 60-second timer showing seconds remaining until the next decode attempt
-- **Live seconds display** — after the first confirmed decode, the UTC time display increments every second using the system clock anchored to the minute-start tone; the minute-pulse back-projection refines the anchor each minute so the running seconds stay aligned to the actual WWV second boundaries
+- **Live seconds display** — after the first confirmed decode, the UTC time display increments every second using a wall-clock anchor tied to the minute-start tone; the `MinutePulseDetected` event carries a timestamp captured on the audio callback thread (not the UI thread) so dispatcher-queue delay cannot corrupt the back-projection; the anchor is refined each minute and running seconds stay aligned to actual WWV second boundaries
 - **Decoded time display** — UTC time, day-of-year, DUT1 offset, DST status, leap-second warning
 - **DST-adjusted local time** — when the DST bit in the frame is active, the local time display automatically adds one hour to the user's selected standard-time UTC offset and appends "DST" to the timezone label (e.g. "UTC-5  EST" → "UTC-4  EDT DST")
 - **Confidence tracking** — hours and minutes are withheld from the display until 2 consecutive Markov-verified increments are observed; date, DUT1, and DST display immediately from the first BCD-valid frame; "Set Clock" requires the same 2-frame threshold
-- **System clock synchronization** — sets Windows system time to the live decoded time including current seconds (requires Administrator)
+- **System clock synchronization** — sets Windows system time to the live decoded time including current seconds (requires Administrator); the correction is gated on **wall-anchor freshness** rather than delta size — if no minute pulse has arrived in the last 90 s the set is skipped and logged, ensuring correctness whether the clock is 200 ms or several years off (dead CMOS battery)
 - **Worldwide station reference database** — 11 HF time-signal stations with frequencies, coordinates, and operating status
 - **Activity log** with file persistence to `%APPDATA%\WwvDecoder\`
 - **Audio device selector** — works with any Windows audio input (sound card, virtual cable, USB receiver)
@@ -221,7 +221,7 @@ The strength of the **100 Hz subcarrier specifically**, after the filters that i
 #### Sync Score
 A 0–100% quality indicator for the 100 Hz subcarrier derived from two sub-scores:
 
-- **Carrier score (65% weight):** Goertzel spectral analysis of the ALE-enhanced audio across a 500 ms window, measuring how prominently the 100 Hz tone stands above its spectral neighbors. High values indicate a clean, strong subcarrier.
+- **Carrier score (65% weight):** Goertzel spectral analysis of the post-notch audio across a 500 ms window, measuring how prominently the 100 Hz tone stands above its spectral neighbors. High values indicate a clean, strong subcarrier.
 - **Cadence score (35% weight):** how regularly the 100 Hz pulses arrive at approximately 1-second intervals. Degrades when ionospheric fading causes missed or overflowed pulses.
 
 Typical values under real HF propagation are 30–70%. Values consistently above 60% indicate a strong, stable signal with good propagation. The status log reports the score every 5 seconds as `sync=N% @100.0 Hz`.
@@ -496,6 +496,8 @@ Pulse classification by duration at exit-threshold crossing:
 - ≥ 700 ms → **MinutePulse** (nominal 800 ms — the P0 minute marker)
 - Other durations are discarded (no valid WWV tone has an intermediate length)
 
+**Tick-index safety clamp:** The bit index derived from each second tick is `round(elapsed_since_anchor) % 60`. C# `%` preserves sign for negative operands, so a future-skewed anchor (anchor set slightly ahead of the actual P0 boundary) could produce negative indices that would cause every subsequent 100 Hz pulse to be discarded by the tick-snap alignment check. The decoder clamps any negative result to `tickBitRaw + 60` and logs a warning, allowing the frame to continue collecting rather than stalling silently.
+
 **Post-minute-pulse threshold reset:** The 800 ms minute pulse drives `_levelHigh` to full 1000 Hz amplitude. With the 3 s decay τ, the enter threshold (50% of `_levelHigh`) stays above the 5 ms tick amplitude for approximately 4 s post-pulse — long enough for seconds 1–4 to be missed entirely. When the MinutePulse event fires, `_levelHigh` is immediately zeroed. This forces the enter threshold to fall back to `8 × noiseFloor`, where a genuine 5 ms tick at any reasonable signal level easily crosses it. The very first second tick (~144 ms after the minute pulse ends) retrains `_levelHigh` to the correct 5 ms tick amplitude for all subsequent ticks in that minute.
 
 #### Adaptive Lowpass
@@ -660,7 +662,10 @@ expected = decoded_anchor + round(DateTime.UtcNow − wall_anchor_time)
 Using real elapsed time rather than a per-frame counter prevents drift escalation during propagation outages where many frames are missed entirely (no `TryDecode` fires for several minutes). The per-frame counter would advance only when a frame actually decodes; the wall-clock formula correctly handles any gap.
 
 - **Drift ≤ 30 s** — the frame is accepted, `_clockVerifiedCount` is incremented, and both anchor values are updated to the current decode. The log shows `Verified #N: HH:MM (drift +0.4s from expected)`.
-- **Drift > 30 s** — the frame is **rejected for time display** (`HoursMinutesConfident = false`, `_clockVerifiedCount` resets to 0), but `SlowFieldsConfident` remains set so date fields still update. The log shows `Clock mismatch: expected HH:MM got HH:MM (drift ±Ns) — rejected`.
+- **Drift > 30 s** — the frame is **rejected for time display** (`HoursMinutesConfident = false`), but `SlowFieldsConfident` remains set so date fields still update. The log shows `Clock mismatch: expected HH:MM got HH:MM (drift ±Ns) — rejected`.
+  - **Soft decay:** if the anchor is already well-established (≥3 verifications) and the drift is small (≤90 s), `_clockVerifiedCount` decreases by 1 rather than resetting to 0 — a single noisy frame cannot erase accumulated confidence.
+  - **UTC offset fast-path:** if the drift is within 90 s of a whole number of hours (±1h, ±2h, …) and enough time bits were directly observed, the decoder recognises a probable local-time/UTC confusion. It requires **2 consecutive frames** to agree on the same hour offset before re-anchoring — a single noise-corrupted hour field can produce exactly ±1h apparent drift and would otherwise cause an oscillation loop where every re-anchor is immediately reversed by the next frame. The first frame logs `UTC offset pending (+1 h) — waiting for confirmation frame`; the second triggers `UTC offset confirmed (+1 h, 2 frames) — re-anchoring`.
+  - **Self-correction:** if the anchor itself is wrong (e.g., seeded from a corrupt first frame), 3 consecutive Markov-failing frames whose decoded times form a consistent +1-minute sequence trigger a re-anchor to the most recent candidate. The candidate queue is checked for freshness: if the most recent entry is older than 90 s it predates a propagation gap and the whole queue is discarded rather than used as the re-anchor source.
 
 **Hours and minutes are only displayed after `_clockVerifiedCount` reaches 2** — two back-to-back Markov-passing frames after the initial anchor. Before that threshold the display shows `--:--:--`. Date, DUT1, and DST are visible immediately from the first BCD-valid frame regardless.
 
@@ -688,6 +693,7 @@ RadioTime Decoder/
 │   ├── InputAgc.cs                 # Input AGC (3 s attack, 5 s decay, 25% target)
 │   ├── HighpassFilter.cs           # 2nd-order Butterworth highpass, 20 Hz cutoff
 │   ├── NotchFilter.cs              # IIR biquad notch (60 Hz and 120 Hz instances)
+│   ├── BandpassFilter.cs           # Pre-filter used by TickDetector to isolate 1000 Hz channel
 │   ├── SynchronousDetector.cs      # Coherent IQ lock-in detector for 100 Hz subcarrier
 │   ├── PulseDetector.cs            # Tick-anchored positive-pulse detection with gated HIGH tracking
 │   ├── MatchedFilter.cs            # HIGH-duration matched filter for pulse classification
@@ -695,8 +701,10 @@ RadioTime Decoder/
 │
 ├── Decoder/
 │   ├── DecoderPipeline.cs          # Wires DSP chain → frame decoder; both 100 Hz and 1000 Hz
+│   ├── DecoderRuntimeSettingsSnapshot.cs  # User-selectable options snapshot (AGC, adaptive LP, trim)
 │   ├── FrameDecoder.cs             # Searching/Syncing/Locked state machine; accumulator voting;
 │   │                               #   soft BCD scoring; cross-frame time seeding; per-field confidence
+│   ├── FrameCell.cs                # Per-bit display state (Confident/Erased/GapFilled/Corrected)
 │   ├── BcdDecoder.cs               # 60-bit BCD frame parser with reserved-bit validation
 │   ├── TimeFrame.cs                # Decoded time data (UTC, DUT1, DST, leap, per-field confidence flags)
 │   └── SignalStatus.cs             # Signal/lock/subcarrier/saturation reporting
@@ -846,6 +854,7 @@ For a classroom or ham radio club demonstration of how atomic time is distribute
 | Decodes but time is wrong | Recording from a different date | Expected for old recordings — the encoded time is when it was recorded |
 | Log shows "Clock mismatch … rejected" | Decoded time inconsistent with prior frame | Decoder rejected the frame and will re-verify; corrects automatically within 1–2 frames if the signal is stable |
 | "Set Clock" button grayed out | Confidence below 2/2 | Wait for Confidence to reach 2/2 — hours/minutes must be Markov-verified before clock set is enabled |
+| Log shows "Clock set skipped: wall anchor is N s old" | No minute pulse received in the last 90 s — anchor is stale | Wait for the next minute pulse (watch for the minute dot to flash), then retry Set Clock |
 | App requires Administrator | Needed for SetSystemTime() | Right-click → Run as Administrator |
 | Crash on start | Missing .NET 9 runtime | Use the self-contained published build, or install .NET 9 |
 

@@ -148,6 +148,7 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     // The display timer computes currentUtc = _liveUtcBase + (UtcNow - _liveWallBase).
     private DateTime? _liveUtcBase;
     private DateTime? _liveWallBase;
+    private DateTime? _liveWallBaseSetAt; // wall-clock time when _liveWallBase was last written
     private readonly System.Windows.Threading.DispatcherTimer _liveClockTimer;
 
     // Receiver mode alert
@@ -292,7 +293,7 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         _pipeline = new DecoderPipeline(OnSignalUpdate, OnFrameDecoded, msg => Log(msg), OnFrameUpdate,
             getSettings: GetDecoderSettings,
             diagnosticLogger: _diagLogger);
-        _pipeline.MinutePulseDetected += OnMinutePulseDetected;
+        _pipeline.MinutePulseDetected += (w, ts) => OnMinutePulseDetected(w, ts);
 
         // Flash the tick dot for 400 ms on each incoming second tick.
         _tickDimTimer = new System.Windows.Threading.DispatcherTimer
@@ -329,8 +330,12 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             MinuteDotOpacity = 0.35;
         };
 
-        _pipeline.MinutePulseDetected += pulseWidth =>
+        _pipeline.MinutePulseDetected += (pulseWidth, capturedUtc) =>
         {
+            // capturedUtc is stamped on the audio callback thread — use it instead of
+            // DateTime.UtcNow inside the dispatcher lambda to avoid accumulating any
+            // dispatcher-queue delay in the wall-anchor back-projection.
+            var wallMinuteStart = capturedUtc - TimeSpan.FromSeconds(pulseWidth);
             Application.Current?.Dispatcher.InvokeAsync(() =>
             {
                 MinuteDotOpacity = 1.0;
@@ -338,7 +343,7 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
                 _minuteDimTimer.Start();
 
                 // Refine the live clock anchor using the back-calculated true minute start
-                // (now minus measured tone duration ≈ 0.8 s).
+                // (captured_utc minus measured tone duration ≈ 0.8 s).
                 //
                 // Edge case: the frame decode handler and this minute-pulse handler both
                 // fire at the SAME P0 boundary (the tone ends ~800 ms into the same second
@@ -348,11 +353,14 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
                 // just sharpen the wall base; ≥ 30 s means it is a genuinely new minute.
                 if (_liveUtcBase.HasValue && _liveWallBase.HasValue)
                 {
-                    var wallMinuteStart  = DateTime.UtcNow - TimeSpan.FromSeconds(pulseWidth);
                     double elapsedSinceBase = (wallMinuteStart - _liveWallBase.Value).TotalSeconds;
                     if (elapsedSinceBase >= 30.0)
                         _liveUtcBase = _liveUtcBase.Value.AddMinutes(1);
-                    _liveWallBase = wallMinuteStart;
+                    _liveWallBase      = wallMinuteStart;
+                    _liveWallBaseSetAt = DateTime.UtcNow;
+                    OnPropertyChanged(nameof(CanSetClock));
+                    OnPropertyChanged(nameof(ClockSetStatusText));
+                    (SetClockCommand as RelayCommand)?.RaiseCanExecuteChanged();
                 }
             });
         };
@@ -636,8 +644,26 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
     // the predicted timeline — so 3 means four consecutive correctly-decoded frames.
     private const int TimeConfidenceThreshold = 2;
 
-    public bool CanSetClock => _latestFrame != null && _latestFrame.IsValid
-                               && _latestFrame.ConfidenceFrames >= TimeConfidenceThreshold;
+    public bool CanSetClock => _latestFrame != null
+                               && _latestFrame.IsValid
+                               && _latestFrame.HoursMinutesConfident
+                               && _latestFrame.ConfidenceFrames >= TimeConfidenceThreshold
+                               && _liveUtcBase != null
+                               && _liveWallBase != null;
+
+    public string ClockSetStatusText
+    {
+        get
+        {
+            if (_latestFrame == null || !_latestFrame.IsValid || !_latestFrame.HoursMinutesConfident)
+                return "Clock set: waiting for confidence 2/2";
+            if (_latestFrame.ConfidenceFrames < TimeConfidenceThreshold)
+                return $"Clock set: waiting for confidence {_latestFrame.ConfidenceFrames}/{TimeConfidenceThreshold}";
+            if (_liveUtcBase == null || _liveWallBase == null)
+                return "Clock set: waiting for minute anchor";
+            return "Clock set: ready";
+        }
+    }
 
     // ── Commands ──────────────────────────────────────────────────────────────
 
@@ -687,8 +713,9 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             _audioInput.Stop();
             _pipeline.Reset();
             _liveClockTimer.Stop();
-            _liveUtcBase      = null;
-            _liveWallBase     = null;
+            _liveUtcBase       = null;
+            _liveWallBase      = null;
+            _liveWallBaseSetAt = null;
             _latestDstActive  = false;
             IsListening = false;
             LockState = LockState.Searching;
@@ -738,9 +765,21 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
 
     private void SetClock()
     {
-        if (_latestFrame == null || _liveUtcBase == null || _liveWallBase == null) return;
+        if (_latestFrame == null || _liveUtcBase == null || _liveWallBase == null || _liveWallBaseSetAt == null) return;
         try
         {
+            // Guard on anchor freshness, not delta size. The computed currentUtc is only
+            // trustworthy when _liveWallBase was recently written by a minute pulse.
+            // A fresh anchor produces a correct correction regardless of how large it is —
+            // years off for a dead CMOS battery, milliseconds for a healthy clock.
+            // A stale anchor (no minute pulse for >90 s) produces an unreliable correction
+            // regardless of how plausible the delta looks, so we skip it unconditionally.
+            double anchorAge = (DateTime.UtcNow - _liveWallBaseSetAt.Value).TotalSeconds;
+            if (anchorAge > 90.0)
+            {
+                Log($"Clock set skipped: wall anchor is {anchorAge:F0} s old — wait for the next minute pulse then retry");
+                return;
+            }
             var currentUtc = _liveUtcBase.Value + (DateTime.UtcNow - _liveWallBase.Value);
             var delta = _timeSetter.SetTime(currentUtc);
             Log($"Clock set to {currentUtc:HH:mm:ss} UTC. Delta was {delta.TotalMilliseconds:+0.0;-0.0} ms");
@@ -751,12 +790,12 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         }
     }
 
-    private void OnMinutePulseDetected(double pulseWidthSeconds)
+    private void OnMinutePulseDetected(double pulseWidthSeconds, DateTime capturedUtc)
     {
         if (!_autoSyncMinuteStart) return;
         try
         {
-            var delta = _timeSetter.SyncMinuteStart(pulseWidthSeconds);
+            var delta = _timeSetter.SyncMinuteStart(pulseWidthSeconds, capturedUtc);
             // Pipeline uses Stopwatch (monotonic) for all timing — no adjustment needed after clock step.
             string info = $"{DateTime.UtcNow:HH:mm} UTC  ({delta.TotalMilliseconds:+0.0;-0.0} ms)";
             Application.Current?.Dispatcher.InvokeAsync(() =>
@@ -882,8 +921,9 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
                 // Anchor the live clock to this confirmed minute boundary.
                 // _liveUtcBase = minute M+1 at :00; _liveWallBase ≈ DateTime.UtcNow at P0.
                 // The minute-pulse handler will refine the wall anchor each subsequent minute.
-                _liveUtcBase  = frame.UtcTime.AddMinutes(1);
-                _liveWallBase = DateTime.UtcNow;
+                _liveUtcBase       = frame.UtcTime.AddMinutes(1);
+                _liveWallBase      = DateTime.UtcNow;
+                _liveWallBaseSetAt = DateTime.UtcNow;
                 if (!_liveClockTimer.IsEnabled)
                     _liveClockTimer.Start();
                 RefreshLiveClock();
@@ -904,6 +944,8 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
                 $"{Math.Min(frame.ConfidenceFrames, TimeConfidenceThreshold)} / {TimeConfidenceThreshold}{checkmark}{lifetime}";
 
             OnPropertyChanged(nameof(CanSetClock));
+            OnPropertyChanged(nameof(ClockSetStatusText));
+            (SetClockCommand as RelayCommand)?.RaiseCanExecuteChanged();
 
             if (timeConfirmed)
                 Log($"Frame confirmed: {t:yyyy-MM-dd HH:mm:ss} UTC  DUT1={frame.Dut1Seconds:+0.0;-0.0}s");

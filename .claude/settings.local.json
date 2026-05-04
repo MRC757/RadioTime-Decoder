@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet test *)",
+      "Bash(git add *)",
+      "Bash(git pull *)",
+      "Bash(git stash *)",
+      "Bash(git commit -m ' *)",
+      "WebFetch(domain:zenodo.org)",
+      "Bash(python -c ' *)",
+      "WebFetch(domain:www.ntp.org)",
+      "Bash(git push *)",
+      "WebFetch(domain:www.mathworks.com)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:tf.nist.gov)",
+      "WebFetch(domain:don.fed.wiki.org)",
+      "Bash(python3 -c \"import pdfplumber; print\\('pdfplumber ok'\\)\")",
+      "Bash(python3 -c \"import pypdf; print\\('pypdf ok'\\)\")",
+      "Bash(python3 -c \"import fitz; print\\('pymupdf ok'\\)\")",
+      "Bash(pdftotext \"c:\\\\Macon Files\\\\Code Projects\\\\RadioTime Decoder\\\\wwv.pdf\" -)",
+      "Bash(xargs cat *)",
+      "Bash(dotnet clean *)",
+      "Bash(findstr /n \"CanSetClock\\\\|SetClockCommand\" ViewModels/MainViewModel.cs)"
+    ]
+  }
+}

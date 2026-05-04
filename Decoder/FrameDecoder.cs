@@ -127,6 +127,18 @@ public class FrameDecoder
     private DateTime? _clockWallAnchor;    // DateTime.UtcNow when anchor was established
     private DateTime? _clockDecodedAnchor; // frame.UtcTime corresponding to wall anchor
     private int _clockVerifiedCount;
+
+    // First-frame anchor hardening. The first plausible frame is only a candidate unless
+    // its time field is completely clean; a second compatible decoded minute promotes it.
+    private DateTime? _pendingInitialAnchorDecoded;
+    private DateTime? _pendingInitialAnchorWall;
+
+    // UTC-offset fast-path confirmation state.
+    // A single frame showing a whole-hour drift is not sufficient to re-anchor — one bad
+    // BCD decode under noise can flip the hour field by exactly 1 h. Require the same
+    // offset direction to appear in 2 consecutive frames before applying the re-anchor.
+    private double _pendingOffsetDriftHours; // rounded hour offset seen last frame (0 = none pending)
+    private int    _pendingOffsetCount;      // consecutive frames agreeing on _pendingOffsetDriftHours
     private int _totalLifetimeVerifications;
 
     // Rolling history of decoded hours from BCD-valid frames. Used by the sanity filter
@@ -205,6 +217,21 @@ public class FrameDecoder
     private int  _lastSecondTickBit = -1;  // bit position of last SecondTick; -1 = none yet
     public bool TickFadeActive { get; private set; }
 
+    /// <summary>
+    /// Returns the frame second index (0–59) derived from elapsed wall-clock time since
+    /// the P0 anchor, or -1 if no anchor is established or the decoder is still Searching.
+    /// Used by DecoderPipeline to identify voice-announcement seconds (52–59) so it can
+    /// bypass the PLL for ticks in that window without disrupting BCD pulse detection.
+    /// </summary>
+    public int GetCurrentSecondIndex()
+    {
+        if (_anchorWallTick == 0 || (_state != State.Syncing && _state != State.Locked))
+            return -1;
+        double elapsed = TicksToSeconds(_getTimestamp() - _anchorWallTick);
+        int raw = (int)Math.Round(elapsed) % 60;
+        return raw < 0 ? raw + 60 : raw;
+    }
+
     // Marker saturation gate: during deep ionospheric fades the 100 Hz carrier drops
     // for ~0.8s even during what should be 0.2/0.5s data-bit periods, so nearly all
     // pulses are classified as Marker. Normal WWV has 7/60 = 11.7% Markers; >60%
@@ -262,6 +289,7 @@ public class FrameDecoder
     private const double MinPulseGapAfterOther   = 0.50;
     private const double FillGapSeconds          = 2.0;
     private const double ResetGapSeconds         = 30.0;
+    private const int FirstAnchorFastPathDirectBits = 13;
 
     public FrameDecoder(Action<SignalStatus> onSignalUpdate, Action<TimeFrame> onFrameDecoded,
                         Action<string>? onLog = null, Action<FrameCell[]>? onFrameUpdate = null,
@@ -294,13 +322,17 @@ public class FrameDecoder
         _envGotA          = false;
         _frameHits = 0;
         _frameTotal = 0;
-        _clockWallAnchor    = null;
-        _clockDecodedAnchor = null;
-        _clockVerifiedCount = 0;
-        _candidateAnchorTick    = 0;
+        _clockWallAnchor         = null;
+        _clockDecodedAnchor      = null;
+        _clockVerifiedCount      = 0;
+        _pendingOffsetDriftHours = 0;
+        _pendingOffsetCount      = 0;
+        _pendingInitialAnchorDecoded = null;
+        _pendingInitialAnchorWall    = null;
+        _candidateAnchorTick      = 0;
         _candidateP0OffsetSeconds = 0;
-        _anchorWallTick         = 0;
-        _skip100HzP0UntilTick   = 0;
+        _anchorWallTick           = 0;
+        _skip100HzP0UntilTick     = 0;
         _tickPendingBitIndex      = -1;
         _tickPendingTimestamp     = 0;
         _lastSignalPercent        = 0;
@@ -695,7 +727,12 @@ public class FrameDecoder
 
             long tickNow = _getTimestamp();
             double elapsed = TicksToSeconds(tickNow - _anchorWallTick);
-            int tickBit = (int)Math.Round(elapsed) % 60;
+            int tickBitRaw = (int)Math.Round(elapsed) % 60;
+            // C# % preserves sign for negative dividends — clamp to [0,59] so a future-skewed
+            // anchor produces bit 0 rather than a negative index that discards every pulse.
+            int tickBit = tickBitRaw < 0 ? tickBitRaw + 60 : tickBitRaw;
+            if (tickBitRaw < 0)
+                _onLog?.Invoke($"[Anchor] Tick landed at raw [{tickBitRaw}] — anchor may be ahead of signal, clamped to [{tickBit}]");
 
             // Anchor-phase diagnostic: log the very first SecondTick after a minute anchor.
             // Reveals whether the back-projection of _anchorWallTick is correct.
@@ -704,6 +741,7 @@ public class FrameDecoder
             //   roundError   = elapsed − round(elapsed)                   (≈ 0 if anchor true)
             // A non-zero roundError or a tickBit ≠ 1 means the anchor is off, and that
             // offset will systematically distort every bit window in the frame.
+            bool firstSecondTickAfterMinute = _diagAwaitingFirstSecondTick;
             if (_diagAwaitingFirstSecondTick)
             {
                 _diagAwaitingFirstSecondTick = false;
@@ -734,6 +772,13 @@ public class FrameDecoder
             // normal pulse counting handles them without tick guidance.
             if (tickBit == 29 || tickBit == 59)
                 return;
+
+            if (firstSecondTickAfterMinute && tickBit >= 4 && _bitIndex <= 3)
+            {
+                _onLog?.Invoke($"Post-minute tick recovery miss: first 1 kHz tick mapped to [{tickBit:D2}] " +
+                               $"while 100 Hz frame is at [{_bitIndex:D2}] — suppressing tick alignment/gap-fill");
+                return;
+            }
 
             // Log each received second tick so the 1000 Hz channel's health is visible.
             // One line per second alongside the 100 Hz BCD pulse lines.
@@ -826,7 +871,8 @@ public class FrameDecoder
                 _bitGapFilled[_bitIndex] = true;
                 _bitIndex++;
             }
-            _onLog?.Invoke($"Near-complete frame rescued at minute boundary (gap-filled {stoppedAt}–59)");
+            string filledPositions = string.Join(",", Enumerable.Range(stoppedAt, 60 - stoppedAt));
+            _onLog?.Invoke($"Near-complete frame rescued at minute boundary (gap-filled [{filledPositions}])");
             TryDecode(_lastSignalPercent);
             // TryDecode resets _bitIndex to 0; fall through to re-anchor below.
         }
@@ -1177,6 +1223,7 @@ public class FrameDecoder
             // _bitWeight is 0 for gap-filled positions and for TickFadeActive pulses,
             // so this only counts bits that came from real received pulses.
             int directTimeBits = TimeBitPositions.Count(p => _bitWeight[p] > 0);
+            frame.DirectTimeBits = directTimeBits;
             frame.TimeFieldConfidence = (float)directTimeBits / TimeBitPositions.Length;
 
             // Gap-fill quality flag: when 3 or more of the 13 time-bit positions were
@@ -1185,6 +1232,7 @@ public class FrameDecoder
             // gap-filled frames cannot seed or re-seed the Markov anchor.
             // Accumulator contribution is already suppressed for gap-filled bits (weight=0).
             int gapFilledTimeBits = TimeBitPositions.Count(p => _bitGapFilled[p]);
+            frame.GapFilledTimeBits = gapFilledTimeBits;
             int effectiveMinDirectTimeBits = gapFilledTimeBits >= 3
                 ? MinDirectTimeBits + 2
                 : MinDirectTimeBits;
@@ -1206,6 +1254,7 @@ public class FrameDecoder
                 var expected = _clockDecodedAnchor!.Value.AddMinutes(minutesElapsed);
 
                 double drift = (frame.UtcTime - expected).TotalSeconds;
+                frame.ClockDriftSeconds = drift;
                 if (Math.Abs(drift) <= 30.0)
                 {
                     _clockVerifiedCount++;
@@ -1222,27 +1271,53 @@ public class FrameDecoder
                     _onLog?.Invoke($"Clock mismatch: expected {expected:HH:mm} " +
                                    $"got {frame.UtcTime:HH:mm} (drift {drift:+0.0;-0.0}s) — rejected");
 
-                    // UTC-offset fast-path: a drift that is very close to a whole number of
-                    // hours (within 90 s) almost certainly means the anchor was seeded with
-                    // local time instead of UTC (e.g., operator is in UTC-4 and the Markov
-                    // clock was primed from local 11:xx while WWV broadcasts 15:xx UTC).
-                    // Re-anchor immediately rather than waiting for 3 candidates — a 3600 s
-                    // multiple is not a plausible BCD bit error or propagation artefact.
+                    // UTC-offset fast-path: a drift very close to a whole number of hours
+                    // (within 90 s) almost certainly means the anchor was seeded with local
+                    // time instead of UTC. Require 2 consecutive frames to agree on the same
+                    // offset direction before re-anchoring — a single noise-corrupted hour
+                    // field can produce exactly ±1 h of apparent drift and immediately flip
+                    // the anchor, causing an oscillation loop on the next frame.
                     double driftHours = drift / 3600.0;
-                    bool isWholeHourOffset = Math.Abs(driftHours - Math.Round(driftHours)) * 3600.0 < 90.0
+                    double roundedOffsetHours = Math.Round(driftHours);
+                    bool isWholeHourOffset = Math.Abs(driftHours - roundedOffsetHours) * 3600.0 < 90.0
                                             && Math.Abs(drift) >= 3600.0;
                     if (isWholeHourOffset && directTimeBits >= effectiveMinDirectTimeBits)
                     {
-                        _onLog?.Invoke($"UTC offset detected ({drift / 3600.0:+0.#;-0.#} h) — " +
-                                       $"re-anchoring immediately to {frame.UtcTime:HH:mm}");
-                        _clockWallAnchor    = DateTime.UtcNow;
-                        _clockDecodedAnchor = frame.UtcTime;
-                        _clockVerifiedCount = 0;
-                        _timeCandidates.Clear();
-                        markovPassed = true;
+                        if (_pendingOffsetCount > 0 && _pendingOffsetDriftHours == roundedOffsetHours)
+                        {
+                            _pendingOffsetCount++;
+                        }
+                        else
+                        {
+                            _pendingOffsetDriftHours = roundedOffsetHours;
+                            _pendingOffsetCount = 1;
+                        }
+
+                        if (_pendingOffsetCount >= 2)
+                        {
+                            _onLog?.Invoke($"UTC offset confirmed ({_pendingOffsetDriftHours:+0;-0} h, " +
+                                           $"{_pendingOffsetCount} frames) — re-anchoring to {frame.UtcTime:HH:mm}");
+                            _clockWallAnchor         = DateTime.UtcNow;
+                            _clockDecodedAnchor      = frame.UtcTime;
+                            _clockVerifiedCount      = 0;
+                            _pendingOffsetCount      = 0;
+                            _pendingOffsetDriftHours = 0;
+                            _timeCandidates.Clear();
+                            _pendingInitialAnchorDecoded = null;
+                            _pendingInitialAnchorWall    = null;
+                            SeedHourHistory(frame.UtcTime.Hour);
+                            markovPassed = true;
+                        }
+                        else
+                        {
+                            _onLog?.Invoke($"UTC offset pending ({_pendingOffsetDriftHours:+0;-0} h) — " +
+                                           $"waiting for confirmation frame");
+                        }
                     }
                     else
                     {
+                        _pendingOffsetCount      = 0;
+                        _pendingOffsetDriftHours = 0;
                         // Soft decay when the clock is already well-established: a single
                         // bad decode (e.g., one noise-flipped minute bit) should not erase
                         // all accumulated confidence.  Only hard-reset when the anchor is
@@ -1266,6 +1341,10 @@ public class FrameDecoder
                         {
                             _timeCandidates.Enqueue((frame.UtcTime, DateTime.UtcNow));
                             if (_timeCandidates.Count > 8) _timeCandidates.Dequeue();
+                            _onLog?.Invoke($"Markov candidate queued: {frame.UtcTime:HH:mm} " +
+                                           $"({directTimeBits}/{TimeBitPositions.Length} direct, " +
+                                           $"{gapFilledTimeBits} gap-filled, threshold {effectiveMinDirectTimeBits}; " +
+                                           $"queue={_timeCandidates.Count})");
 
                             if (TryGetConsistentCandidateTime(out DateTime reanchorTime))
                             {
@@ -1275,10 +1354,24 @@ public class FrameDecoder
                                 _clockDecodedAnchor = reanchorTime;
                                 _clockVerifiedCount = 0;
                                 _timeCandidates.Clear();
+                                _pendingInitialAnchorDecoded = null;
+                                _pendingInitialAnchorWall    = null;
+                                SeedHourHistory(reanchorTime.Hour);
                                 // The reset frame itself is treated as the new first-frame anchor;
                                 // the next frame will be the first Markov check against this anchor.
                                 markovPassed = true;
                             }
+                            else
+                            {
+                                _onLog?.Invoke($"Markov candidate sequence not yet consistent " +
+                                               $"({_timeCandidates.Count}/{AnchorSelfCorrectionMinFrames} queued)");
+                            }
+                        }
+                        else
+                        {
+                            _onLog?.Invoke($"Markov candidate skipped: only {directTimeBits}/" +
+                                           $"{TimeBitPositions.Length} direct time bits " +
+                                           $"(threshold {effectiveMinDirectTimeBits}, gap-filled {gapFilledTimeBits})");
                         }
                     }
                 }
@@ -1292,12 +1385,58 @@ public class FrameDecoder
                 // in a Markov rejection loop for the rest of the session.
                 if (directTimeBits >= effectiveMinDirectTimeBits)
                 {
-                    _clockWallAnchor    = DateTime.UtcNow;
-                    _clockDecodedAnchor = frame.UtcTime;
-                    markovPassed = true;
-                    _clockVerifiedCount = 0; // anchor established; first Markov check is next frame
-                    _onLog?.Invoke($"Anchor established: {frame.UtcTime:HH:mm} " +
-                                   $"({directTimeBits}/{TimeBitPositions.Length} time bits observed)");
+                    bool fastPath = directTimeBits >= FirstAnchorFastPathDirectBits
+                                 && gapFilledTimeBits == 0
+                                 && frameTotal > 0
+                                 && frameHits == frameTotal;
+
+                    if (fastPath)
+                    {
+                        _clockWallAnchor    = DateTime.UtcNow;
+                        _clockDecodedAnchor = frame.UtcTime;
+                        markovPassed = true;
+                        _clockVerifiedCount = 0; // anchor established; first Markov check is next frame
+                        _pendingInitialAnchorDecoded = null;
+                        _pendingInitialAnchorWall    = null;
+                        SeedHourHistory(frame.UtcTime.Hour);
+                        _onLog?.Invoke($"Anchor established fast-path: {frame.UtcTime:HH:mm} " +
+                                       $"({directTimeBits}/{TimeBitPositions.Length} direct, no gap-filled time bits)");
+                    }
+                    else if (_pendingInitialAnchorDecoded.HasValue)
+                    {
+                        double decodedGap = (frame.UtcTime - _pendingInitialAnchorDecoded.Value).TotalSeconds;
+                        bool compatible = Math.Abs(decodedGap - 60.0) <= 30.0;
+                        if (compatible)
+                        {
+                            _clockWallAnchor    = _pendingInitialAnchorWall ?? DateTime.UtcNow;
+                            _clockDecodedAnchor = _pendingInitialAnchorDecoded.Value;
+                            _clockVerifiedCount = 1;
+                            _totalLifetimeVerifications++;
+                            markovPassed = true;
+                            frame.ClockDriftSeconds = decodedGap - 60.0;
+                            _pendingInitialAnchorDecoded = null;
+                            _pendingInitialAnchorWall    = null;
+                            SeedHourHistory(frame.UtcTime.Hour);
+                            _onLog?.Invoke($"Initial anchor promoted: {frame.UtcTime:HH:mm} " +
+                                           $"confirmed prior candidate (decoded gap {decodedGap:+0;-0}s)");
+                        }
+                        else
+                        {
+                            _onLog?.Invoke($"Initial anchor candidate replaced: prior " +
+                                           $"{_pendingInitialAnchorDecoded.Value:HH:mm}, current {frame.UtcTime:HH:mm} " +
+                                           $"(decoded gap {decodedGap:+0;-0}s)");
+                            _pendingInitialAnchorDecoded = frame.UtcTime;
+                            _pendingInitialAnchorWall    = DateTime.UtcNow;
+                        }
+                    }
+                    else
+                    {
+                        _pendingInitialAnchorDecoded = frame.UtcTime;
+                        _pendingInitialAnchorWall    = DateTime.UtcNow;
+                        _onLog?.Invoke($"Initial anchor pending: {frame.UtcTime:HH:mm} " +
+                                       $"({directTimeBits}/{TimeBitPositions.Length} direct, " +
+                                       $"{gapFilledTimeBits} gap-filled time bits) â€” waiting for confirmation frame");
+                    }
                 }
                 else
                 {
@@ -1309,6 +1448,7 @@ public class FrameDecoder
 
             if (markovPassed)
             {
+                frame.MarkovPassed = true;
                 frame.HoursMinutesConfident = true;
 
                 // Update the persistent slow-bit store from this validated frame.
@@ -1654,9 +1794,13 @@ public class FrameDecoder
         Array.Clear(_bitCorrected, 0, 60);
         _frameHits = 0;
         _frameTotal = 0;
-        _clockWallAnchor    = null;
-        _clockDecodedAnchor = null;
-        _clockVerifiedCount = 0;
+        _clockWallAnchor         = null;
+        _clockDecodedAnchor      = null;
+        _clockVerifiedCount      = 0;
+        _pendingOffsetDriftHours = 0;
+        _pendingOffsetCount      = 0;
+        _pendingInitialAnchorDecoded = null;
+        _pendingInitialAnchorWall    = null;
         _candidateAnchorTick      = 0;
         _candidateP0OffsetSeconds = 0;
         _skip100HzP0UntilTick     = 0;
@@ -1990,6 +2134,18 @@ public class FrameDecoder
         int needed = AnchorSelfCorrectionMinFrames;
         if (cands.Length < needed) return false;
 
+        // Reject the candidate sequence if the most recent entry is stale — it was
+        // enqueued more than 90 s ago, meaning it predates a propagation gap. Candidates
+        // from before a gap can appear mutually self-consistent (each +1 minute apart)
+        // while being several minutes behind the current time, causing a backward
+        // time jump when re-anchored.
+        double staleness = (DateTime.UtcNow - cands[^1].WallUtc).TotalSeconds;
+        if (staleness > 90.0)
+        {
+            _timeCandidates.Clear();
+            return false;
+        }
+
         // Examine the last `needed` consecutive pairs
         int start = cands.Length - needed;
         int consistent = 0;
@@ -2020,6 +2176,14 @@ public class FrameDecoder
         var next = verifiedUtc.AddMinutes(1);
         SeedAccumulatorField(next.Minute, [10, 11, 12, 13, 15, 16, 17], [1, 2, 4, 8, 10, 20, 40]);
         SeedAccumulatorField(next.Hour,   [20, 21, 22, 23, 25, 26],      [1, 2, 4, 8, 10, 20]);
+    }
+
+    // Overwrite the rolling hour history with the anchor hour so pre-anchor wrong
+    // decodes cannot block subsequent correct frames from passing the sanity filter.
+    private void SeedHourHistory(int anchorHour)
+    {
+        _recentDecodedHours.Clear();
+        for (int i = 0; i < 5; i++) _recentDecodedHours.Enqueue(anchorHour);
     }
 
     private void SeedAccumulatorField(int value, int[] positions, int[] weights)

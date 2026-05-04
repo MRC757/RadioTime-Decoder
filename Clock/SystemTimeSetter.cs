@@ -53,15 +53,18 @@ public class SystemTimeSetter
     /// pulse width to estimate when the true minute boundary actually occurred, then set
     /// the clock to HH:MM:00.000 of that estimated moment.
     ///
+    /// capturedUtc must be stamped on the audio callback thread at the moment of pulse
+    /// detection — do not pass DateTime.UtcNow from a deferred dispatcher lambda.
+    ///
     /// Returns the correction applied (positive = clock was running late).
     /// </summary>
-    public TimeSpan SyncMinuteStart(double pulseWidthSeconds)
+    public TimeSpan SyncMinuteStart(double pulseWidthSeconds, DateTime capturedUtc)
     {
-        var before    = DateTime.UtcNow;
+        var before = DateTime.UtcNow;
 
-        // Estimate true minute-start: now minus the pulse duration we just measured.
+        // Estimate true minute-start: capturedUtc minus the pulse duration we just measured.
         // The minute pulse starts at HH:MM:00.000 and lasts ~800 ms; we detect it at the end.
-        var trueStart = before - TimeSpan.FromSeconds(pulseWidthSeconds);
+        var trueStart = capturedUtc - TimeSpan.FromSeconds(pulseWidthSeconds);
 
         // Guard: if the subtraction crossed a minute boundary (seconds ≥ 30), the pulse-
         // width subtraction took us into the previous minute. Advance by one minute so we

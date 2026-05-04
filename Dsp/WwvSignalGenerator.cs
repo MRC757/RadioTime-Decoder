@@ -29,7 +29,6 @@ public class WwvSignalGenerator
     private double _tickPhase;
 
     // Current playback position within a 60-second frame
-    private int _framePosition;     // sample index within current frame (0..60×sampleRate-1)
     private int _secondIndex;       // bit index (0..59)
     private int _sampleInSecond;    // sample offset within the current second
 
