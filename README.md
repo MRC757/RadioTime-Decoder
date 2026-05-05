@@ -47,6 +47,7 @@ Built with WPF (.NET 9) and the MVVM pattern. Dark-themed UI with real-time sign
 - **Confidence tracking** — hours and minutes are withheld from the display until 2 consecutive Markov-verified increments are observed; date, DUT1, and DST display immediately from the first BCD-valid frame; "Set Clock" requires the same 2-frame threshold
 - **System clock synchronization** — sets Windows system time to the live decoded time including current seconds (requires Administrator); the correction is gated on **wall-anchor freshness** rather than delta size — if no minute pulse has arrived in the last 90 s the set is skipped and logged, ensuring correctness whether the clock is 200 ms or several years off (dead CMOS battery)
 - **Worldwide station reference database** — 11 HF time-signal stations with frequencies, coordinates, and operating status
+- **Per-session statistics** — at the end of each listening session, a summary logs: frames decoded, Markov verification rate, lock-loss events, soft-scoring corrections, and gap-filled bits. Provides immediate field observability without requiring log grep.
 - **Activity log** with file persistence to `%APPDATA%\WwvDecoder\`
 - **Audio device selector** — works with any Windows audio input (sound card, virtual cable, USB receiver)
 

@@ -63,7 +63,7 @@ public class SecondTickPll
     // Gate half-widths in Stopwatch ticks
     private readonly long _gateUnlocked;  // first cold-start tick only
     private readonly long _gateLocked;    // all subsequent ticks (Acquiring and Locked)
-    private readonly long _maxFadeOutDuration; // max time to generate synthetic ticks (8 s)
+    private readonly long _maxFadeOutDuration; // max time to generate synthetic ticks (13 s)
 
     private const double KAcquiring     = 0.3;
     private const double KLocked        = 0.1;
@@ -80,7 +80,7 @@ public class SecondTickPll
         _freq         = Stopwatch.Frequency;
         _gateUnlocked = (long)(_freq * 0.500);
         _gateLocked   = (long)(_freq * 0.150);
-        _maxFadeOutDuration = _freq * 8; // 8 seconds max predictive generation
+        _maxFadeOutDuration = _freq * 13; // 13 seconds max predictive generation
         _onLog        = onLog;
     }
 

@@ -711,6 +711,11 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
         if (_isListening)
         {
             _audioInput.Stop();
+
+            // Log session statistics summary before reset wipes the counters
+            var sessionSummary = _pipeline.GetSessionSummary();
+            Log(sessionSummary);
+
             _pipeline.Reset();
             _liveClockTimer.Stop();
             _liveUtcBase       = null;
@@ -948,8 +953,8 @@ public class MainViewModel : INotifyPropertyChanged, IDisposable
             (SetClockCommand as RelayCommand)?.RaiseCanExecuteChanged();
 
             if (timeConfirmed)
-                Log($"Frame confirmed: {t:yyyy-MM-dd HH:mm:ss} UTC  DUT1={frame.Dut1Seconds:+0.0;-0.0}s");
-            else if (frame.SlowFieldsConfident && !frame.HoursMinutesConfident)
+                return; // Frame confirmation is now logged in FrameDecoder's consolidated Verified message
+            if (frame.SlowFieldsConfident && !frame.HoursMinutesConfident)
             {
                 int timePct = (int)Math.Round(frame.TimeFieldConfidence * 100);
                 Log($"Partial frame: date={t:yyyy-MM-dd} DOY={t.DayOfYear:D3} " +

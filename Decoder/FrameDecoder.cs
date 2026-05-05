@@ -141,6 +141,14 @@ public class FrameDecoder
     private int    _pendingOffsetCount;      // consecutive frames agreeing on _pendingOffsetDriftHours
     private int _totalLifetimeVerifications;
 
+    // Per-session statistics (all reset by Reset(), accumulated during the listen session).
+    private DateTime _sessionStartWall;      // Wall-clock time when Reset() was called (session start)
+    private int _sessionFramesDecoded;       // BCD-valid frames that passed date gate
+    private int _sessionMarkovVerified;      // Frames that passed Markov clock check
+    private int _sessionLockLossEvents;      // Number of times state transitioned to Searching
+    private int _sessionSoftCorrections;     // Bits corrected by soft BCD constraint scoring
+    private int _sessionGapFilledBits;       // Bits filled during signal blackouts
+
     // Rolling history of decoded hours from BCD-valid frames. Used by the sanity filter
     // to reject implausible hour jumps (e.g. 05:xx when session has been at 15:xx for 30 min).
     // Only populated from frames that pass the date gate and prior sanity check.
@@ -178,6 +186,13 @@ public class FrameDecoder
     private long   _diagMinutePulseEndTick;
     private double _diagMinutePulseWidth;
     private bool   _diagAwaitingFirstSecondTick;
+
+    // Minute pulse width quality tracking.
+    // Nominal width is 800 ms; significant deviations (>100 ms) indicate signal degradation.
+    // Used to track signal quality changes over time.
+    private const double MinutePulseNominalMs = 800.0;
+    private const double MinutePulseDegradationThresholdMs = 100.0; // flag deviation if > 100 ms
+    private double _lastMinutePulseDeviationMs = 0.0;
 
     // Pending 1000 Hz second-tick state.
     // Each second tick (except 29 and 59, which are omitted per NIST) records the
@@ -291,6 +306,13 @@ public class FrameDecoder
     private const double ResetGapSeconds         = 30.0;
     private const int FirstAnchorFastPathDirectBits = 13;
 
+    // Markov clock verification threshold: decoded frame must be within this window
+    // of the expected time (based on wall-clock elapsed + prior anchor) to be accepted.
+    // Narrower than the traditional 30s (which accommodates full minute rounding) because
+    // WWV is cesium-sourced (< 1 s/month drift) and the only real source of > 15 s error
+    // is a noise-flipped BCD bit (which moves by ±60s, well outside this band).
+    private const double MarkovDriftThresholdSeconds = 15.0;
+
     public FrameDecoder(Action<SignalStatus> onSignalUpdate, Action<TimeFrame> onFrameDecoded,
                         Action<string>? onLog = null, Action<FrameCell[]>? onFrameUpdate = null,
                         Func<long>? getTimestamp = null)
@@ -346,7 +368,47 @@ public class FrameDecoder
         _timeCandidates.Clear();
         _recentDecodedHours.Clear();
         _signalTooFaded = false;
+
+        // Reset session statistics counters
+        _sessionStartWall      = DateTime.UtcNow;
+        _sessionFramesDecoded  = 0;
+        _sessionMarkovVerified = 0;
+        _sessionLockLossEvents = 0;
+        _sessionSoftCorrections = 0;
+        _sessionGapFilledBits  = 0;
+
         ReportStatus();
+    }
+
+    /// <summary>
+    /// Returns a formatted multi-line session statistics summary capturing the current
+    /// state of all per-session counters. Call this before Reset() to preserve the counters.
+    /// </summary>
+    public string GetSessionSummary()
+    {
+        var elapsed = DateTime.UtcNow - _sessionStartWall;
+        string durationStr = $"{(int)elapsed.TotalHours}h {elapsed.Minutes:D2}m {elapsed.Seconds:D2}s";
+
+        double verifyRate = _sessionFramesDecoded > 0
+            ? (_sessionMarkovVerified * 100.0 / _sessionFramesDecoded)
+            : 0.0;
+
+        double corrPerFrame = _sessionFramesDecoded > 0
+            ? (_sessionSoftCorrections / (double)_sessionFramesDecoded)
+            : 0.0;
+
+        var lines = new System.Collections.Generic.List<string>
+        {
+            "=== Session Summary ===",
+            $"Duration:              {durationStr}",
+            $"Frames decoded:        {_sessionFramesDecoded}  (BCD valid)",
+            $"Markov verified:       {_sessionMarkovVerified}  ({verifyRate:F1}%)",
+            $"Lock-loss events:      {_sessionLockLossEvents}",
+            $"Soft corrections:      {_sessionSoftCorrections} bits total  ({corrPerFrame:F2}/frame)",
+            $"Gap-filled bits:       {_sessionGapFilledBits}"
+        };
+
+        return string.Join(Environment.NewLine, lines);
     }
 
     public void OnPulse(PulseEvent pulse, double peakEnvelope, double noiseFloor, double subcarrierLevel)
@@ -484,6 +546,7 @@ public class FrameDecoder
                         _bitConfident[_bitIndex] = false;
                         _bitWeight[_bitIndex]    = 0.0;
                         _bitGapFilled[_bitIndex] = true;
+                        _sessionGapFilledBits++;  // Session statistics: track gap-filled bits
                         _bitIndex++;
                         PublishFrameVisualization();
                     }
@@ -851,8 +914,15 @@ public class FrameDecoder
                            && _bitIndex == 1 && _anchorWallTick != 0;
         if (alreadyAtP0)
         {
+            // Track minute pulse width deviation.
+            double widthMs = tick.WidthSeconds * 1000.0;
+            _lastMinutePulseDeviationMs = widthMs - MinutePulseNominalMs;
+            string deviationNote = Math.Abs(_lastMinutePulseDeviationMs) > MinutePulseDegradationThresholdMs
+                ? $" [MinutePulse] width={widthMs:F0}ms ({_lastMinutePulseDeviationMs:+0;-0}ms from nominal)"
+                : string.Empty;
+
             _lockQuality = Math.Min(1.0, _lockQuality + 0.10);
-            _onLog?.Invoke($"Minute pulse confirms P0 ({tick.WidthSeconds:F3}s)  [100 Hz was first]");
+            _onLog?.Invoke($"Minute pulse confirms P0 ({tick.WidthSeconds:F3}s){deviationNote}  [100 Hz was first]");
             return;
         }
 
@@ -906,9 +976,17 @@ public class FrameDecoder
         _diagMinutePulseEndTick      = now;
         _diagMinutePulseWidth        = tick.WidthSeconds;
         _diagAwaitingFirstSecondTick = true;
-        _onLog?.Invoke($"[Anchor diag] MinutePulse end-of-tone: width={tick.WidthSeconds * 1000:F1}ms, " +
-                       $"projected anchor = (end-of-tone) − {tick.WidthSeconds * 1000:F1}ms " +
-                       $"(nominal width = 800.0 ms)");
+
+        // Track minute pulse width deviation from nominal 800 ms.
+        double pulseWidthMs = tick.WidthSeconds * 1000.0;
+        _lastMinutePulseDeviationMs = pulseWidthMs - MinutePulseNominalMs;
+        string deviationLogNote = Math.Abs(_lastMinutePulseDeviationMs) > MinutePulseDegradationThresholdMs
+            ? $" [MinutePulse] width={pulseWidthMs:F0}ms ({_lastMinutePulseDeviationMs:+0;-0}ms from nominal)"
+            : string.Empty;
+
+        _onLog?.Invoke($"[Anchor diag] MinutePulse end-of-tone: width={pulseWidthMs:F1}ms, " +
+                       $"projected anchor = (end-of-tone) − {pulseWidthMs:F1}ms " +
+                       $"(nominal width = {MinutePulseNominalMs:F1} ms){deviationLogNote}");
 
         // Reset the inter-pulse gap timer to P0 so the gap-fill algorithm measures gaps
         // relative to this anchor, not to the last 100 Hz pulse from the previous minute.
@@ -959,6 +1037,12 @@ public class FrameDecoder
             // Locked: new frame started. Stay Locked — only re-anchor if noticeably late.
             string note = prevIndex > 2 ? $" [was at [{prevIndex:D2}], re-anchored]" : string.Empty;
             _onLog?.Invoke($"Minute pulse → P0 anchor ({tick.WidthSeconds:F3}s){note}");
+        }
+
+        // Output minute pulse width quality indicator if deviation is significant.
+        if (Math.Abs(_lastMinutePulseDeviationMs) > MinutePulseDegradationThresholdMs)
+        {
+            _onLog?.Invoke($"[MinutePulse] width={_diagMinutePulseWidth * 1000:F0}ms ({_lastMinutePulseDeviationMs:+0;-0}ms from nominal)");
         }
 
         ReportStatus(_lastSignalPercent);
@@ -1134,7 +1218,12 @@ public class FrameDecoder
         // replaces the threshold-based vote for that field. This resolves borderline bits
         // toward the nearest valid BCD value using the full soft evidence rather than
         // hard thresholding each bit independently.
-        ApplySoftBcdScoring(votedBits);
+        int softScoringCorrections = ApplySoftBcdScoring(votedBits);
+        if (softScoringCorrections > 0)
+        {
+            _onLog?.Invoke($"[DIAG] soft-scoring-corrections: {softScoringCorrections}");
+            _sessionSoftCorrections += softScoringCorrections;
+        }
 
         // BCD-constrained post-processing: catches any remaining out-of-range digit after
         // soft scoring (should be rare now, but kept as a safety net).
@@ -1208,6 +1297,9 @@ public class FrameDecoder
 
         if (frame != null)
         {
+            // Session statistics: track this decoded frame
+            _sessionFramesDecoded++;
+
             // BCD decode succeeded and passed all plausibility gates — slow fields (date,
             // DOY, DUT1, DST, leap) are structurally valid regardless of whether the Markov
             // clock check passes. Flag them so the UI can display date data immediately.
@@ -1255,13 +1347,15 @@ public class FrameDecoder
 
                 double drift = (frame.UtcTime - expected).TotalSeconds;
                 frame.ClockDriftSeconds = drift;
-                if (Math.Abs(drift) <= 30.0)
+                if (Math.Abs(drift) <= MarkovDriftThresholdSeconds)
                 {
                     _clockVerifiedCount++;
                     _totalLifetimeVerifications++;
+                    _sessionMarkovVerified++;
                     markovPassed = true;
                     _onLog?.Invoke($"Verified #{_clockVerifiedCount}: {frame.UtcTime:HH:mm} " +
-                                   $"(drift {drift:+0.0;-0.0}s from expected {expected:HH:mm})");
+                                   $"(drift {drift:+0.0;-0.0}s from expected {expected:HH:mm}) " +
+                                   $"— {frame.UtcTime:yyyy-MM-dd HH:mm:ss} UTC DUT1={frame.Dut1Seconds:+0.0;-0.0}s");
                     _clockWallAnchor    = DateTime.UtcNow;
                     _clockDecodedAnchor = frame.UtcTime;
                     _timeCandidates.Clear(); // clean slate after a confirmed frame
@@ -1660,17 +1754,19 @@ public class FrameDecoder
             // so that a clear A but borderline B still contributes partial evidence.
             double confA = Math.Clamp(Math.Abs(_envSampleA / levelHigh - 0.5) * 2.0, 0.0, 1.0);
             double confB = Math.Clamp(Math.Abs(envelope    / levelHigh - 0.5) * 2.0, 0.0, 1.0);
-            alpha *= (confA + confB) * 0.5;
+            alpha *= (confA + confB) * 0.5 * _lastSnrFactor;
 
             if (!aHigh && !bHigh)
             {
                 // Both LOW → Zero (HIGH period ended before 350 ms — only 200 ms wide)
                 _bitAccumulator[bitPos] += alpha * (-1.0 - _bitAccumulator[bitPos]);
+                _bitAccumulator[bitPos] = Math.Clamp(_bitAccumulator[bitPos], -0.95, +0.95);
             }
             else if (aHigh && !bHigh)
             {
                 // HIGH at 350 ms, LOW at 650 ms → One (HIGH period ended between 350–650 ms)
                 _bitAccumulator[bitPos] += alpha * (+1.0 - _bitAccumulator[bitPos]);
+                _bitAccumulator[bitPos] = Math.Clamp(_bitAccumulator[bitPos], -0.95, +0.95);
             }
             // aHigh && bHigh → Marker erasure (100 Hz channel handles this)
             // !aHigh && bHigh → inverted/multipath erasure — no accumulator update
@@ -1785,6 +1881,9 @@ public class FrameDecoder
 
     private void ResetToSearching(double signalPercent)
     {
+        // Session statistics: track lock-loss event
+        _sessionLockLossEvents++;
+
         _state = State.Searching;
         _lockQuality = 0;
         _bitIndex = 0;
@@ -1978,6 +2077,15 @@ public class FrameDecoder
             }
         }
 
+        // Clamp accumulators to prevent saturation freeze. At ±0.95 a single contradicting
+        // frame still produces a meaningful correction (0.60 × 1.95 ≈ 0.22 swing), while
+        // unclamped values approaching ±1.0 become nearly immutable.
+        for (int i = 0; i < 60; i++)
+        {
+            if (!IsExpectedMarkerPosition(i) && !IsReservedPosition(i))
+                _bitAccumulator[i] = Math.Clamp(_bitAccumulator[i], -0.95, +0.95);
+        }
+
         if (minMargin == double.MaxValue) minMargin = 1.0;
         return (voted, persistFallbacks, structFallbacks, minMargin, minMarginPos);
     }
@@ -2037,27 +2145,31 @@ public class FrameDecoder
     // and write it back into votedBits. This handles the common case where one or two
     // marginal bits have pushed the threshold-based vote into an invalid BCD value, or
     // where a borderline bit should be resolved toward the nearest valid time field.
-    private void ApplySoftBcdScoring(int[] votedBits)
+    private int ApplySoftBcdScoring(int[] votedBits)
     {
+        int corrections = 0;
+
         // Minutes: positions 10-13 (units 1,2,4,8), 15-17 (tens 10,20,40); valid 0-59
         int[] minPos = [10, 11, 12, 13, 15, 16, 17];
         int[] minWt  = [1,  2,  4,  8,  10, 20, 40];
-        EncodeBcdIntoVoted(votedBits, SoftDecodeBcdField(minPos, minWt, ValidMinutes()), minPos, minWt);
+        corrections += EncodeBcdIntoVotedWithCount(votedBits, SoftDecodeBcdField(minPos, minWt, ValidMinutes()), minPos, minWt);
 
         // Hours: positions 20-23 (units 1,2,4,8), 25-26 (tens 10,20); valid 0-23
         int[] hrPos = [20, 21, 22, 23, 25, 26];
         int[] hrWt  = [1,  2,  4,  8,  10, 20];
-        EncodeBcdIntoVoted(votedBits, SoftDecodeBcdField(hrPos, hrWt, ValidHours()), hrPos, hrWt);
+        corrections += EncodeBcdIntoVotedWithCount(votedBits, SoftDecodeBcdField(hrPos, hrWt, ValidHours()), hrPos, hrWt);
 
         // DOY: positions 30-33 (units), 35-38 (tens), 40-41 (hundreds); valid 1-366
         int[] doyPos = [30, 31, 32, 33, 35, 36, 37, 38, 40, 41];
         int[] doyWt  = [1,  2,  4,  8,  10, 20, 40, 80, 100, 200];
-        EncodeBcdIntoVoted(votedBits, SoftDecodeBcdField(doyPos, doyWt, ValidDoy()), doyPos, doyWt);
+        corrections += EncodeBcdIntoVotedWithCount(votedBits, SoftDecodeBcdField(doyPos, doyWt, ValidDoy()), doyPos, doyWt);
 
         // Year: positions 4-7 (units 1,2,4,8), 51-54 (tens 10,20,40,80); valid 0-99
         int[] yrPos = [4,  5,  6,  7,  51, 52, 53, 54];
         int[] yrWt  = [1,  2,  4,  8,  10, 20, 40, 80];
-        EncodeBcdIntoVoted(votedBits, SoftDecodeBcdField(yrPos, yrWt, ValidYear()), yrPos, yrWt);
+        corrections += EncodeBcdIntoVotedWithCount(votedBits, SoftDecodeBcdField(yrPos, yrWt, ValidYear()), yrPos, yrWt);
+
+        return corrections;
     }
 
     private static IEnumerable<int> ValidMinutes()
@@ -2114,6 +2226,22 @@ public class FrameDecoder
             if (bitSet) remaining -= weights[i];
             voted[positions[i]] = bitSet ? 1 : 0;
         }
+    }
+
+    private static int EncodeBcdIntoVotedWithCount(int[] voted, int value, int[] positions, int[] weights)
+    {
+        int corrections = 0;
+        int remaining = value;
+        for (int i = positions.Length - 1; i >= 0; i--)
+        {
+            bool bitSet = remaining >= weights[i];
+            if (bitSet) remaining -= weights[i];
+            int newBit = bitSet ? 1 : 0;
+            if (voted[positions[i]] != newBit)
+                corrections++;
+            voted[positions[i]] = newBit;
+        }
+        return corrections;
     }
 
     // ── Markov anchor self-correction ────────────────────────────────────────

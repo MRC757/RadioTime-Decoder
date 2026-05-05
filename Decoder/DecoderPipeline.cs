@@ -409,6 +409,12 @@ public class DecoderPipeline
         _tickLockState = TickLockState.NoSignal;
     }
 
+    /// <summary>
+    /// Returns a formatted session statistics summary from the frame decoder.
+    /// Call before Reset() to preserve the current counters.
+    /// </summary>
+    public string GetSessionSummary() => _frameDecoder.GetSessionSummary();
+
     // ── Diagnostic helpers ────────────────────────────────────────────────────
 
     private void AccumulateDiagBuffers(

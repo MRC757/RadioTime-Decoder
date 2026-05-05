@@ -31,28 +31,6 @@ dotnet publish -c Release
 
 ## Project Structure
 
-### Core DSP Pipeline (Dsp/)
-The signal processing chain processes audio in 50 ms blocks (22,050 Hz, 16-bit mono):
-
-1. **InputAgc** — automatic gain control (3 s attack, 5 s decay) normalizing to 25% full scale
-2. **HighpassFilter** — 2nd-order Butterworth, 20 Hz cutoff (removes DC and hum)
-3. **NotchFilter** (×2) — 60 Hz and 120 Hz (eliminates US power-line interference)
-4. **SynchronousDetector** — coherent IQ lock-in detector at 100 Hz subcarrier:
-   - Demodulates in-phase and quadrature, lowpass-filters each to ~2 Hz
-   - Envelope = 2√(I²+Q²) — phase-independent amplitude extraction
-   - Adaptive: widens to 8 Hz during HF fading (tracked by IsAmplitudeUnstable flag)
-   - 15–25 dB SNR improvement over bandpass + rectifier
-5. **PulseDetector** — tick-anchored positive-pulse detection:
-   - Tracks 75th-percentile of last 30 inter-pulse carrier peaks (rejects outliers)
-   - Enters at 55% of real-time IIR HIGH level; exits at 62% (7% hysteresis)
-   - Fade detection: triggers when envelope < 15% of stable reference for >200 ms
-6. **MatchedFilter** — classifies pulses by HIGH-period duration:
-   - Counts samples > 50% of midpoint threshold (eliminates rise/fall time bias)
-   - Classifications: <50ms=Tick, 50–350ms=Zero, 350–650ms=One, ≥650ms=Marker
-7. **TickDetector** — 1000 Hz IQ demodulator (parallel to 100 Hz channel):
-   - Resolves 5 ms second ticks and 800 ms minute pulse
-   - Classifies: ≤50ms=SecondTick, ≥700ms=MinutePulse
-
 **Key insight:** No carrier PLL is used because the 100 Hz subcarrier is amplitude-keyed (on/off), not frequency-modulated. The frequency in AM-demodulated baseband audio is exact by definition (sourced from NIST atomic standard).
 
 ### Frame Decoder (Decoder/)
@@ -138,13 +116,6 @@ Tests use **xUnit** with synthetic signal generation:
 
 ## Common Workflows
 
-### Adding a DSP filter or detector
-
-1. Create a new class in Dsp/ (e.g., `MyDetector.cs`)
-2. Follow the pattern: `Process(float[] samples)` → updates internal state, fires event callbacks if needed
-3. Add to **DecoderPipeline** wiring (constructor) and **ProcessSamples** call sequence
-4. If a new event callback is needed, add it to DecoderPipeline and MainViewModel
-
 ### Tuning DSP parameters
 
 Parameters are scattered across multiple classes (InputAgc attack/decay, notch bandwidth, lowpass cutoff, thresholds, etc.). Each is documented with its purpose and typical value:
@@ -168,11 +139,6 @@ The activity log is comprehensive. Key log signatures:
 - `Gap filled: N bits` — blackout recovery
 - `Operator date applied` — user-supplied date hint used
 
-### Adding a new station
-
-1. Edit **StationsDatabase.cs** — add entry to the database array
-2. UI automatically populates from StationsDatabase; no hardcoding needed
-
 ## Development Notes
 
 - **Nullable types enabled** — null safety is enforced; watch for nullable warnings in AudioInputDevice callbacks
@@ -183,8 +149,6 @@ The activity log is comprehensive. Key log signatures:
 
 ## Architecture Decisions
 
-- **Why exponential moving average instead of ring buffer majority voting?** EMA with slow decay allows clean-frame evidence to persist across fades (~11 min half-life), whereas a fixed ring buffer would lose all history on buffer wraparound. NIST NTP driver 36 uses this approach.
+- **Why exponential moving average instead of ring buffer majority voting?** EMA with slow decay allows clean-frame evidence to persist across fades (~11 min half-life), whereas a fixed ring buffer would lose all history on buffer wraparound.
 - **Why soft BCD constraint scoring?** Resolves marginal bits that fall between the vote threshold and structural default. Hard thresholding produces invalid BCD digits in ~2% of partial frames; soft scoring recovers them.
-- **Why three-point bipolar discriminator?** Provides independent carrier-timing measurement during partial fades that extend past Zero LOW but not One LOW. Threshold-crossing detector misclassifies in these cases, discriminator is correct.
-- **Why wall-clock Markov validation instead of per-frame counter?** Handles propagation outages gracefully: missing several frames doesn't cause per-frame counter to stall, whereas wall-clock formula (using real elapsed time) automatically fills gaps.
 - **Why 75th percentile carrier reference?** Rejects multipath spikes (high outliers) and HF-faded HIGH periods (low outliers). IIR alone would be distorted by either extreme; percentile window solves both simultaneously.
